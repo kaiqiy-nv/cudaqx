@@ -100,10 +100,10 @@ test_examples() {
         docker exec ${container_name} bash -c "pip install 'stim' 'beliefmatching'"
     fi
 
-    docker exec -w /home/cudaq -it ${container_name} bash -c "mkdir -p test_data/chromobius"
-    docker exec -w /home/cudaq/test_data/chromobius -it ${container_name} bash -c "wget -O basic_reference.dem https://raw.githubusercontent.com/NVIDIA/cudaqx/refs/heads/main/libs/qec/test_data/chromobius/basic_reference.dem"
-    docker exec -w /home/cudaq/test_data/chromobius -it ${container_name} bash -c "wget -O basic_reference.tsv https://raw.githubusercontent.com/NVIDIA/cudaqx/refs/heads/main/libs/qec/test_data/chromobius/basic_reference.tsv"
-    docker exec -w /home/cudaq/test_data/chromobius -it ${container_name} bash -c "pwd && ls -lh"
+    docker exec -w /home/cudaq ${container_name} bash -c "mkdir -p test_data/chromobius"
+    docker exec -w /home/cudaq/test_data/chromobius ${container_name} bash -c "wget -O basic_reference.dem https://raw.githubusercontent.com/NVIDIA/cudaqx/refs/heads/main/libs/qec/test_data/chromobius/basic_reference.dem"
+    docker exec -w /home/cudaq/test_data/chromobius ${container_name} bash -c "wget -O basic_reference.tsv https://raw.githubusercontent.com/NVIDIA/cudaqx/refs/heads/main/libs/qec/test_data/chromobius/basic_reference.tsv"
+    docker exec -w /home/cudaq/test_data/chromobius ${container_name} bash -c "pwd && ls -lh"
 
     # CUDA-Q import sanity check (baked into image)
     if ! docker exec ${container_name} bash -c "\
