@@ -103,6 +103,7 @@ test_examples() {
     docker exec -w /home/cudaq -it ${container_name} bash -c "mkdir -p test_data/chromobius"
     docker exec -w /home/cudaq/test_data/chromobius -it ${container_name} bash -c "wget https://raw.githubusercontent.com/NVIDIA/cudaqx/refs/heads/main/libs/qec/test_data/chromobius/basic_reference.dem"
     docker exec -w /home/cudaq/test_data/chromobius -it ${container_name} bash -c "wget https://raw.githubusercontent.com/NVIDIA/cudaqx/refs/heads/main/libs/qec/test_data/chromobius/basic_reference.tsv"
+    docker exec -w /home/cudaq/test_data/chromobius -it ${container_name} bash -c "pwd && ls -lh"
 
     # CUDA-Q import sanity check (baked into image)
     if ! docker exec ${container_name} bash -c "\
