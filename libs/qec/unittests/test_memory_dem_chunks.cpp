@@ -310,6 +310,26 @@ TEST(MemoryDemChunks, RejectsNonemptyMatrixWithNullBorrowedStorage) {
   EXPECT_THROW(split(inputs), std::invalid_argument);
 }
 
+TEST(MemoryDemChunks, RejectsZeroFaultMatricesBeforePhaseConstruction) {
+  auto inputs = fixture();
+  const auto detector_count = inputs.dem.num_detectors();
+  const auto observable_count = inputs.dem.num_observables();
+  inputs.dem.detector_error_matrix =
+      cudaqx::tensor<std::uint8_t>({detector_count, 0});
+  inputs.dem.observables_flips_matrix =
+      cudaqx::tensor<std::uint8_t>({observable_count, 0});
+  inputs.dem.error_rates.clear();
+
+  try {
+    split(inputs);
+    FAIL() << "expected zero-fault DEM to be rejected";
+  } catch (const std::invalid_argument &error) {
+    EXPECT_STREQ(error.what(),
+                 "memory DEM chunks: zero-fault phases are not supported by "
+                 "extended_dem on this framework revision");
+  }
+}
+
 TEST(MemoryDemChunks, RejectsInvalidProbabilitiesAndCorrelations) {
   for (const auto value : {-0.1, 1.1, std::numeric_limits<double>::infinity(),
                            std::numeric_limits<double>::quiet_NaN()}) {

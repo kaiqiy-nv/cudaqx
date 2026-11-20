@@ -8,6 +8,10 @@
 /// Unit tests for the shared persistent QEC thread pool.
 
 #include "../lib/decoding_task/thread_pool.h"
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -57,6 +61,23 @@ TEST(QecThreadPool, SingleThreadRunsEveryTaskInline) {
 
   EXPECT_EQ(executions, (std::array<std::size_t, 5>{1, 1, 1, 1, 1}));
 } // end - SingleThreadRunsEveryTaskInline
+
+TEST(QecThreadPool, ParallelForSkipsEmptyPhase) {
+  thread_pool pool(/*num_threads=*/2);
+  std::size_t callback_calls = 0;
+
+  pool.parallel_for(0, [&](std::size_t /*task*/, std::size_t /*worker*/) {
+    ++callback_calls;
+  });
+  EXPECT_EQ(callback_calls, 0);
+
+  pool.parallel_for(1, [&](std::size_t task, std::size_t worker) {
+    ++callback_calls;
+    EXPECT_EQ(task, 0);
+    EXPECT_EQ(worker, 0);
+  });
+  EXPECT_EQ(callback_calls, 1);
+} // end - ParallelForSkipsEmptyPhase
 
 TEST(QecThreadPool, ParkedWorkersWakeForALaterPhase) {
   thread_pool pool(/*num_threads=*/4);
@@ -116,6 +137,105 @@ TEST(QecThreadPool, RunWorkersPropagatesErrorsAndRemainsReusable) {
   }));
   EXPECT_EQ(workers.load(std::memory_order_relaxed), 4);
 } // end - RunWorkersPropagatesErrorsAndRemainsReusable
+
+TEST(QecThreadPool, ZeroCountAndRoundRobinRespectCpuCap) {
+#if !defined(__linux__)
+  GTEST_SKIP() << "worker CPU affinity is Linux-only";
+#else
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  ASSERT_EQ(pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed),
+            0);
+  int allowed_cpu = -1;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+    if (CPU_ISSET(cpu, &allowed)) {
+      allowed_cpu = cpu;
+      break;
+    }
+  ASSERT_GE(allowed_cpu, 0);
+
+  thread_pool zero_requested(
+      /*num_threads=*/0, {allowed_cpu}, thread_pool::AffinityPolicy::RoundRobin);
+  EXPECT_GE(zero_requested.num_threads(), 1u);
+  EXPECT_LE(zero_requested.num_threads(), 2u);
+
+  thread_pool capped(/*num_threads=*/8, {allowed_cpu},
+                     thread_pool::AffinityPolicy::RoundRobin);
+  EXPECT_EQ(capped.num_threads(), 2u);
+  std::array<std::atomic<std::size_t>, 4> executions{};
+  std::array<std::atomic<std::size_t>, 4> workers{};
+  capped.parallel_for(4, [&](std::size_t task, std::size_t worker) {
+    executions[task].fetch_add(1, std::memory_order_relaxed);
+    workers[task].store(worker, std::memory_order_relaxed);
+  });
+  for (std::size_t task = 0; task < executions.size(); ++task) {
+    EXPECT_EQ(executions[task].load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(workers[task].load(std::memory_order_relaxed), task % 2);
+  }
+#endif
+} // end - ZeroCountAndRoundRobinRespectCpuCap
+
+TEST(QecThreadPool, FloatAffinityAppliesCompleteMaskToOwnedWorkers) {
+#if !defined(__linux__)
+  GTEST_SKIP() << "worker CPU affinity is Linux-only";
+#else
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  ASSERT_EQ(pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed),
+            0);
+  int allowed_cpu = -1;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+    if (CPU_ISSET(cpu, &allowed)) {
+      allowed_cpu = cpu;
+      break;
+    }
+  ASSERT_GE(allowed_cpu, 0);
+
+  thread_pool pool(/*num_threads=*/2, {allowed_cpu},
+                   thread_pool::AffinityPolicy::Float);
+  cpu_set_t worker_affinity;
+  CPU_ZERO(&worker_affinity);
+  int affinity_error = -1;
+  pool.run_workers([&](std::size_t worker) {
+    if (worker == 1)
+      affinity_error = pthread_getaffinity_np(
+          pthread_self(), sizeof(worker_affinity), &worker_affinity);
+  });
+
+  ASSERT_EQ(affinity_error, 0);
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+    EXPECT_EQ(CPU_ISSET(cpu, &worker_affinity) != 0, cpu == allowed_cpu);
+#endif
+} // end - FloatAffinityAppliesCompleteMaskToOwnedWorkers
+
+TEST(QecThreadPool, StartupAffinityFailureJoinsWorkers) {
+#if !defined(__linux__)
+  GTEST_SKIP() << "worker CPU affinity is Linux-only";
+#else
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  ASSERT_EQ(pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed),
+            0);
+  int allowed_cpu = -1;
+  int unavailable_cpu = -1;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &allowed)) {
+      if (allowed_cpu < 0)
+        allowed_cpu = cpu;
+    } else if (unavailable_cpu < 0) {
+      unavailable_cpu = cpu;
+    }
+  }
+  ASSERT_GE(allowed_cpu, 0);
+  if (unavailable_cpu < 0)
+    GTEST_SKIP() << "all representable CPUs are available to this process";
+
+  EXPECT_THROW((void)thread_pool(
+                   /*num_threads=*/3, {allowed_cpu, unavailable_cpu},
+                   thread_pool::AffinityPolicy::RoundRobin),
+               std::runtime_error);
+#endif
+} // end - StartupAffinityFailureJoinsWorkers
 
 } // namespace
 } // namespace cudaq::qec::detail

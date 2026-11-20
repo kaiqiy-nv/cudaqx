@@ -425,6 +425,16 @@ class GeneratorCliTest(unittest.TestCase):
                 model = self.assert_server(document)
                 self.assertEqual(26 * model["measurements_per_round"] + 9, 217)
 
+    def test_explicit_error_rate_is_applied_to_generated_model(self):
+        _, document = self.generate(**{"error-rate": "0.02"})
+        model = self.assert_server(document)
+        probabilities = [
+            probability for phase in model["phases"]
+            for probability in phase["spec"]["error_rates"]
+        ]
+        self.assertTrue(probabilities)
+        self.assertTrue(any(probability != 0.001 for probability in probabilities))
+
     def test_model_factorization_follows_backend(self):
 
         def maximum_fault_degree(model):

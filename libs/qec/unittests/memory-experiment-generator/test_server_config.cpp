@@ -8,15 +8,20 @@
 #include "cudaq/qec/decoder_config_schema.h"
 #include "cudaq/qec/decoding_task_graph.h"
 #include "cudaq/qec/realtime/decoding_config.h"
+#include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iterator>
 #include <limits>
+#include <signal.h>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
+#include <sys/resource.h>
 
 namespace cudaq::qec::memory_experiment {
 namespace {
@@ -90,6 +95,39 @@ struct scoped_pattern_schema_extension {
   }
 
   ~scoped_pattern_schema_extension() {
+    config::register_decoder_schema(std::move(original));
+  }
+};
+
+struct scoped_nested_pattern_schema_extension {
+  config::decoder_schema original;
+
+  scoped_nested_pattern_schema_extension()
+      : original(*config::find_decoder_schema(
+            task_graph_node_schema_name("parallel_window"))) {
+    constexpr auto fixed_schema_name =
+        "server_config_nested_fixed_test_schema";
+    constexpr auto discriminated_schema_name =
+        "server_config_nested_discriminated_test_schema";
+    config::register_decoder_schema(
+        {fixed_schema_name,
+         {{"passes", config::param_kind::uint64},
+          {"label", config::param_kind::string}}});
+    config::register_decoder_schema(
+        {discriminated_schema_name,
+         {{"scale", config::param_kind::f64},
+          {"enabled", config::param_kind::boolean}}});
+    auto extended = original;
+    extended.params.push_back({"fixed_section", config::param_kind::subschema,
+                               false, fixed_schema_name});
+    extended.params.push_back({"backend", config::param_kind::string});
+    extended.params.push_back(
+        {"backend_section", config::param_kind::discriminated, false, "",
+         "backend"});
+    config::register_decoder_schema(std::move(extended));
+  }
+
+  ~scoped_nested_pattern_schema_extension() {
     config::register_decoder_schema(std::move(original));
   }
 };
@@ -200,6 +238,70 @@ TEST(MemoryExperimentServerConfig,
               "most_likely");
     EXPECT_EQ(parameters.get<std::string>("verify_residual"), "report");
   }
+}
+
+TEST(MemoryExperimentServerConfig, NestedPatternArgumentSectionsRoundtrip) {
+  const preparation_request request{
+      {"surface_code", 3, 26, 1, memory_basis::z}};
+  const auto model = prepare_model(request);
+  scoped_nested_pattern_schema_extension schema_extension;
+
+  auto options = reference_options();
+  const auto without_sections = config::multi_decoder_config::from_yaml_str(
+      emit_server_config(model, options, 1));
+  ASSERT_EQ(without_sections.decoders.size(), 1);
+  ASSERT_TRUE(without_sections.decoders.front().task_graph);
+  const auto &default_parameters = without_sections.decoders.front()
+                                      .task_graph->nodes.front()
+                                      .node_params.map();
+  EXPECT_FALSE(default_parameters.contains("fixed_section"));
+  EXPECT_FALSE(default_parameters.contains("backend_section"));
+
+  options.pattern_args = {
+      "fixed_section.passes=7",
+      "fixed_section.label=nested-value",
+      "backend=server_config_nested_discriminated_test_schema",
+      "backend_section.scale=1.25",
+      "backend_section.enabled=true"};
+  const auto with_sections = config::multi_decoder_config::from_yaml_str(
+      emit_server_config(model, options, 1));
+  ASSERT_EQ(with_sections.decoders.size(), 1);
+  ASSERT_TRUE(with_sections.decoders.front().task_graph);
+  const auto &parameters = with_sections.decoders.front()
+                               .task_graph->nodes.front()
+                               .node_params.map();
+  const auto fixed_section =
+      parameters.get<cudaqx::heterogeneous_map>("fixed_section");
+  EXPECT_EQ(fixed_section.get<std::size_t>("passes"), 7);
+  EXPECT_EQ(fixed_section.get<std::string>("label"), "nested-value");
+  EXPECT_EQ(parameters.get<std::string>("backend"),
+            "server_config_nested_discriminated_test_schema");
+  const auto backend_section =
+      parameters.get<cudaqx::heterogeneous_map>("backend_section");
+  EXPECT_EQ(backend_section.get<double>("scale"), 1.25);
+  EXPECT_TRUE(backend_section.get<bool>("enabled"));
+
+  options.pattern_args = {"fixed_section=direct-value"};
+  EXPECT_THROW(validate_server_config_options(options), std::invalid_argument);
+}
+
+TEST(MemoryExperimentServerConfig,
+     EmptyArgsAllowSupportedDecoderWithoutSchema) {
+  constexpr const char *supported_decoders[] = {"nv-qldpc-decoder",
+                                                 "nv-fusion-decoder"};
+  const auto decoder_without_schema = std::find_if(
+      std::begin(supported_decoders), std::end(supported_decoders),
+      [](const char *decoder) {
+        return cudaq::qec::decoder::is_registered(decoder) &&
+               config::find_decoder_schema(decoder) == nullptr;
+      });
+  if (decoder_without_schema == std::end(supported_decoders))
+    GTEST_SKIP() << "Requires a supported registered decoder without a schema";
+
+  auto options = reference_options();
+  options.decoder = *decoder_without_schema;
+  options.decoder_args.clear();
+  EXPECT_NO_THROW(validate_server_config_options(options));
 }
 
 TEST(MemoryExperimentServerConfig, PatternSchemaRejectsInvalidArguments) {
@@ -476,6 +578,77 @@ TEST(MemoryExperimentServerConfig, PublishesOnlyServerYamlWithoutOverwriting) {
   EXPECT_EQ(std::distance(std::filesystem::directory_iterator(temporary.path),
                           std::filesystem::directory_iterator()),
             1);
+}
+
+TEST(MemoryExperimentServerConfig, WriteFailureRemovesPartialFile) {
+  const preparation_request request{
+      {"surface_code", 3, 26, 1, memory_basis::z}};
+  const auto model = prepare_model(request);
+  const auto options = reference_options();
+  temporary_server_directory temporary;
+  const auto output = temporary.path / "server.yaml";
+
+  struct scoped_file_size_limit {
+    struct rlimit original_limit {};
+    struct sigaction original_sigxfsz_action {};
+    bool limit_changed = false;
+    bool signal_changed = false;
+
+    scoped_file_size_limit() {
+      if (::getrlimit(RLIMIT_FSIZE, &original_limit) != 0)
+        throw std::system_error(errno, std::generic_category(), "getrlimit");
+      if (::sigaction(SIGXFSZ, nullptr, &original_sigxfsz_action) != 0)
+        throw std::system_error(errno, std::generic_category(), "sigaction");
+
+      struct sigaction ignored_action {};
+      ignored_action.sa_handler = SIG_IGN;
+      if (::sigemptyset(&ignored_action.sa_mask) != 0)
+        throw std::system_error(errno, std::generic_category(), "sigemptyset");
+      if (::sigaction(SIGXFSZ, &ignored_action, nullptr) != 0)
+        throw std::system_error(errno, std::generic_category(), "sigaction");
+      signal_changed = true;
+
+      auto limited = original_limit;
+      limited.rlim_cur = 0;
+      if (::setrlimit(RLIMIT_FSIZE, &limited) != 0) {
+        const auto error = errno;
+        restore();
+        throw std::system_error(error, std::generic_category(), "setrlimit");
+      }
+      limit_changed = true;
+    }
+
+    ~scoped_file_size_limit() { restore(); }
+
+    void restore() noexcept {
+      if (limit_changed) {
+        ::setrlimit(RLIMIT_FSIZE, &original_limit);
+        limit_changed = false;
+      }
+      if (signal_changed) {
+        ::sigaction(SIGXFSZ, &original_sigxfsz_action, nullptr);
+        signal_changed = false;
+      }
+    }
+  };
+
+  bool caught_write_error = false;
+  std::string error_message;
+  {
+    scoped_file_size_limit process_state;
+    try {
+      write_server_config(request, model, options, output);
+    } catch (const std::system_error &error) {
+      caught_write_error = true;
+      error_message = error.what();
+    }
+  }
+
+  EXPECT_TRUE(caught_write_error);
+  EXPECT_NE(error_message.find("cannot write server configuration"),
+            std::string::npos);
+  EXPECT_FALSE(std::filesystem::exists(output));
+  EXPECT_TRUE(std::filesystem::is_empty(temporary.path));
 }
 
 TEST(MemoryExperimentServerConfig,

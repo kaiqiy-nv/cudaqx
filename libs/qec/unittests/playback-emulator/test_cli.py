@@ -7,6 +7,7 @@ import argparse
 import csv
 import io
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,204 @@ decoders:
         self.assertEqual(records[0]["status"], "0")
         self.assertEqual(records[0]["dispatched"], "1")
 
+    def test_help(self):
+        result = subprocess.run([EMULATOR, "--help"],
+                                text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Usage: playback-emulator --schedule=<file>",
+                      result.stdout)
+
+    def test_missing_schedule(self):
+        result = subprocess.run([EMULATOR],
+                                text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Usage: playback-emulator --schedule=<file>",
+                      result.stdout)
+
+    def test_unknown_option(self):
+        result = self.invoke("--unknown-option")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unrecognized argument: --unknown-option",
+                      result.stderr)
+
+    def test_udp_backend_requires_endpoint_for_config_decoder(self):
+        result = self.invoke("--backend=udp")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--backend=udp: decoder 0 in --config has no "
+                      "--*-endpoint=", result.stderr)
+
+    def test_cpu_roce_backend_requires_endpoint_for_config_decoder(self):
+        result = self.invoke("--backend=cpu_roce")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--backend=cpu_roce: decoder 0 in --config has no "
+                      "--*-endpoint=", result.stderr)
+
+    def test_inproc_backend_dispatches_fixture_decoder(self):
+        result = self.invoke("--backend=inproc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_reset_csv(result.stdout)
+
+    def test_inproc_backend_filters_endpoint_claimed_decoder(self):
+        decoder = """\
+    type: single_error_lut
+    block_size: 1
+    syndrome_size: 1
+    H_sparse: [0, -1]
+    O_sparse: [0, -1]
+    D_sparse: [0, -1]
+"""
+        self.config.write_text("decoders:\n"
+                               "  - id: 0\n" + decoder +
+                               "  - id: 1\n" + decoder)
+        self.schedule.write_text("0 reset session=1\n")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as endpoint:
+            endpoint.bind(("127.0.0.1", 0))
+            port = endpoint.getsockname()[1]
+            result = self.invoke(
+                "--backend=inproc",
+                f"--udp-endpoint=0:127.0.0.1:{port}")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = list(csv.DictReader(io.StringIO(result.stdout)))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["op"], "reset")
+        self.assertEqual(records[0]["decoder_id"], "1")
+        self.assertEqual(records[0]["status"], "0")
+        self.assertEqual(records[0]["dispatched"], "1")
+
+    def test_inproc_endpoint_claim_preserves_static_source_stream(self):
+        help_result = subprocess.run([EMULATOR, "--help"],
+                                     text=True,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE,
+                                     timeout=15)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("Usage: playback-emulator --schedule=<file>",
+                      help_result.stdout)
+
+        decoder = """\
+    type: single_error_lut
+    block_size: 1
+    syndrome_size: 1
+    H_sparse: [0, -1]
+    O_sparse: [0, -1]
+    D_sparse: [0, -1]
+"""
+        self.config.write_text("decoders:\n"
+                               "  - id: 0\n" + decoder +
+                               "  - id: 1\n" + decoder +
+                               "syndrome_mapping:\n"
+                               "  - {id: 1, type: final}\n")
+        source = self.root / "source.txt"
+        source.write_text("1\n0\n")
+        self.schedule.write_text("0 stream session=1 source=0 rounds=1\n"
+                                 "1 enqueue_data session=1 source=0\n")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as endpoint:
+            endpoint.bind(("127.0.0.1", 0))
+            port = endpoint.getsockname()[1]
+            result = self.invoke(
+                "--backend=inproc",
+                f"--udp-endpoint=0:127.0.0.1:{port}",
+                f"--source=0:{source}")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = list(csv.DictReader(io.StringIO(result.stdout)))
+        self.assertEqual([record["op"] for record in records],
+                         ["stream", "enqueue_data"])
+        self.assertEqual([record["decoder_id"] for record in records],
+                         ["1", "1"])
+        self.assertEqual([record["syndrome_bits"] for record in records],
+                         ["1", "0"])
+
+    def test_conflicting_endpoints_rejected_before_backend_creation(self):
+        result = self.invoke(
+            "--backend=cpu_roce",
+            "--udp-endpoint=0:127.0.0.1:1234",
+            "--cpu-roce-endpoint=0:127.0.0.1:1234",
+            "--cpu-roce-timeout=1ms",
+            "--cpu-roce-connect-timeout=1ms",
+            "--cpu-roce-device=mlx5_0",
+            "--cpu-roce-local-ip=127.0.0.1",
+            "--cpu-roce-slots=8",
+            "--cpu-roce-slot-size=256")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("decoder 0 has both a --udp-endpoint= and a "
+                      "--cpu-roce-endpoint=", result.stderr)
+
+    def test_cpu_roce_endpoint_requires_device_and_local_ip(self):
+        result = self.invoke("--backend=cpu_roce",
+                             "--cpu-roce-endpoint=0:127.0.0.1:1234")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--cpu-roce-endpoint= requires --cpu-roce-device= "
+                      "and --cpu-roce-local-ip=", result.stderr)
+
+    def test_endpoint_parser_rejects_malformed_values(self):
+        cases = (
+            ("--udp-endpoint=missing-separator",
+             "--udp-endpoint expects ID:HOST:PORT"),
+            ("--cpu-roce-endpoint=not-an-id:127.0.0.1:1234",
+             "--cpu-roce-endpoint must be a whole number that fits in 64 bits"),
+        )
+        for argument, expected_error in cases:
+            with self.subTest(argument=argument):
+                result = self.invoke(argument)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected_error, result.stderr)
+
+    def test_inproc_static_source_stream_and_final_mapping(self):
+        self.config.write_text(self.config.read_text() +
+                               "syndrome_mapping:\n"
+                               "  - {id: 1, type: final}\n")
+        source = self.root / "source.txt"
+        source.write_text("1\n0\n")
+        self.schedule.write_text("0 stream source=0 rounds=1\n"
+                                 "1 enqueue_data source=0\n")
+
+        result = self.invoke("--backend=inproc", f"--source=0:{source}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = list(csv.DictReader(io.StringIO(result.stdout)))
+        self.assertEqual([record["op"] for record in records],
+                         ["stream", "enqueue_data"])
+        self.assertEqual([record["syndrome_bits"] for record in records],
+                         ["1", "0"])
+
+    def test_static_source_file_parser_edges(self):
+        self.config.write_text(self.config.read_text() +
+                               "syndrome_mapping:\n"
+                               "  - {id: 1, type: final}\n")
+        self.schedule.write_text("0 stream source=0 rounds=1\n"
+                                 "1 enqueue_data source=0\n")
+        source = self.root / "source.txt"
+        source.write_bytes(b"\r\n1\r\n\n0\r\n")
+
+        result = self.invoke("--backend=inproc", f"--source=0:{source}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = list(csv.DictReader(io.StringIO(result.stdout)))
+        self.assertEqual([record["syndrome_bits"] for record in records],
+                         ["1", "0"])
+
+        source.write_bytes(b"1\nx\n")
+        result = self.invoke("--backend=inproc", f"--source=0:{source}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            f"{source}:2: malformed bit string 'x': expected only '0'/'1'",
+            result.stderr)
+
+        missing_source = self.root / "missing-source.txt"
+        result = self.invoke("--backend=inproc",
+                             f"--source=0:{missing_source}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"cannot open source file: {missing_source}",
+                      result.stderr)
+
     def test_csv_stdout(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -105,6 +304,18 @@ decoders:
         result = self.invoke("--lead-in=0ns")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_reset_csv(result.stdout)
+
+    def test_duration_unit_scaling_and_millisecond_overflow(self):
+        result = self.invoke("--tick=1us", "--lead-in=1ms",
+                             "--udp-timeout=1ms")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_reset_csv(result.stdout)
+
+        result = self.invoke("--udp-timeout=4294967296s")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "duration '4294967296s' must be a whole number of milliseconds",
+            result.stderr)
 
     def stim_source(self, **noise):
         return ("--stim-source=0:code=surface_code,task=rotated_memory_z,"

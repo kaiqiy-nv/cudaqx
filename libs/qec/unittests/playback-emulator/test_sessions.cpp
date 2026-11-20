@@ -25,7 +25,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -257,6 +259,22 @@ TEST(SessionOrdering, ParserAndPlanRejectAnUncollectableRead) {
 // edges -- empty/huge frames, reply-buffer bounds, repeated calls -- since a
 // backend whose job is to cost nothing is the likeliest to skip a bounds check.
 
+TEST(NullBackendAdvanced, FactoryCreatesIndependentSessionsForDecoderIds) {
+  const std::vector<std::uint64_t> decoder_ids{17, 4, 29};
+  const auto sessions = make_null_sessions(decoder_ids);
+
+  ASSERT_EQ(sessions.size(), decoder_ids.size());
+  for (std::size_t index = 0; index < decoder_ids.size(); ++index) {
+    EXPECT_EQ(sessions[index].first, decoder_ids[index]);
+    ASSERT_NE(sessions[index].second, nullptr);
+    EXPECT_EQ(sessions[index].second->max_frame_bytes, 0u);
+  }
+
+  for (std::size_t left = 0; left < sessions.size(); ++left)
+    for (std::size_t right = left + 1; right < sessions.size(); ++right)
+      EXPECT_NE(sessions[left].second.get(), sessions[right].second.get());
+}
+
 TEST(NullBackendAdvanced,
      FramesOfEverySizeAreDiscardedWithoutCrashingOrReplying) {
   // 0 bits and the odd widths either side of a power of two are the edges
@@ -281,6 +299,29 @@ TEST(NullBackendAdvanced,
     EXPECT_TRUE(result.records[0].read_completed);
     EXPECT_EQ(result.records[0].correction_count, bits);
   }
+}
+
+TEST(NullBackendAdvanced, ShortFrameReadHasNoReplyPayload) {
+  auto s = make_null_session();
+  std::unordered_map<std::uint64_t, session *> router{{0, s.get()}};
+  auto scheduled =
+      plan(parse("0 get_corrections return_size=1\n", {0}, 1000), router, {},
+           {});
+
+  ASSERT_EQ(scheduled->event_plans.size(), 1u);
+  ASSERT_EQ(scheduled->event_plans[0].size(), 1u);
+  scheduled->event_plans[0][0].frame_len = sizeof(RPCHeader) - 1;
+
+  const auto result = run(scheduled);
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_TRUE(result.records[0].dispatched);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
+  EXPECT_FALSE(result.records[0].read_completed);
+  ASSERT_EQ(result.request_status_log.size(), 1u);
+  EXPECT_EQ(result.request_status_log[0],
+            static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
 }
 
 TEST(NullBackendAdvanced, MaxFrameBytesIsUnboundedAndStaysThatWayUnderLoad) {
@@ -331,7 +372,110 @@ std::string closed_loopback_endpoint() {
   return "127.0.0.1:" + std::to_string(port);
 }
 
+class malformed_reply_server {
+public:
+  malformed_reply_server() {
+    fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ::bind(fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    socklen_t len = sizeof(addr);
+    ::getsockname(fd_, reinterpret_cast<sockaddr *>(&addr), &len);
+    endpoint_ = "127.0.0.1:" + std::to_string(ntohs(addr.sin_port));
+
+    timeval tv{};
+    tv.tv_usec = 50'000;
+    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    thread_ = std::thread([this] { serve(); });
+  }
+
+  ~malformed_reply_server() {
+    stop_.store(true);
+    if (thread_.joinable())
+      thread_.join();
+    ::close(fd_);
+  }
+
+  const std::string &endpoint() const { return endpoint_; }
+
+  std::vector<std::uint32_t> arrivals() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return arrivals_;
+  }
+
+  bool sent_bad_magic() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return sent_bad_magic_;
+  }
+
+  bool sent_unknown_id() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return sent_unknown_id_;
+  }
+
+private:
+  void serve() {
+    std::vector<std::uint8_t> buf(256);
+    while (!stop_.load()) {
+      sockaddr_in from{};
+      socklen_t from_len = sizeof(from);
+      const ssize_t n =
+          ::recvfrom(fd_, buf.data(), buf.size(), 0,
+                     reinterpret_cast<sockaddr *>(&from), &from_len);
+      if (n < static_cast<ssize_t>(sizeof(RPCHeader)))
+        continue;
+
+      RPCHeader header{};
+      std::memcpy(&header, buf.data(), sizeof(header));
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        arrivals_.push_back(header.function_id);
+      }
+      if (header.function_id !=
+          cudaq::qec::decoding::rpc::kResetDecoderFunctionId)
+        continue;
+
+      RPCResponse bad_magic{};
+      bad_magic.magic = 0;
+      bad_magic.request_id = header.request_id;
+      const bool bad_magic_sent =
+          ::sendto(fd_, &bad_magic, sizeof(bad_magic), 0,
+                   reinterpret_cast<sockaddr *>(&from), from_len) ==
+          static_cast<ssize_t>(sizeof(bad_magic));
+
+      RPCResponse unknown_id{};
+      unknown_id.magic = cudaq::realtime::RPC_MAGIC_RESPONSE;
+      unknown_id.request_id = header.request_id + 1;
+      const bool unknown_id_sent =
+          ::sendto(fd_, &unknown_id, sizeof(unknown_id), 0,
+                   reinterpret_cast<sockaddr *>(&from), from_len) ==
+          static_cast<ssize_t>(sizeof(unknown_id));
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        sent_bad_magic_ = bad_magic_sent;
+        sent_unknown_id_ = unknown_id_sent;
+      }
+    }
+  }
+
+  int fd_ = -1;
+  std::string endpoint_;
+  mutable std::mutex mu_;
+  std::vector<std::uint32_t> arrivals_;
+  bool sent_bad_magic_ = false;
+  bool sent_unknown_id_ = false;
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
 } // namespace
+
+TEST(UdpBackendAdvanced, EmptyEndpointMapReturnsNoSessions) {
+  const auto sessions = make_udp_sessions(
+      std::unordered_map<std::uint64_t, std::string>{}, /*timeout_ms=*/50);
+  EXPECT_TRUE(sessions.empty());
+}
 
 TEST(UdpBackendAdvanced,
      AwaitOnAGenuinelyClosedPortTimesOutBoundedAndReturnsAnError) {
@@ -424,6 +568,46 @@ TEST(UdpBackendAdvanced,
 }
 
 TEST(UdpBackendAdvanced,
+     MalformedAndStaleRepliesThenSendFailureDrainsPendingRequest) {
+  malformed_reply_server responder;
+  constexpr std::uint32_t kTimeoutMs = 5'000;
+  auto sessions = make_udp_sessions(
+      std::unordered_map<std::uint64_t, std::string>{{0, responder.endpoint()}},
+      kTimeoutMs);
+  ASSERT_EQ(sessions.size(), 1u);
+  auto &udp_session = sessions[0].second;
+  udp_session->max_frame_bytes = 0;
+  std::unordered_map<std::uint64_t, session *> router{
+      {0, udp_session.get()}};
+
+  constexpr std::size_t kBits = 523'616;
+  auto sched = parse("0 reset\n100 enqueue source=0b" +
+                         std::string(kBits, '1') + "\n",
+                     {0}, 1'000'000);
+  auto scheduled = plan(sched, router, {}, {});
+  scheduled->params.ack_drain_timeout_ns = 0;
+  auto result = run(scheduled);
+
+  ASSERT_EQ(result.records.size(), 2u);
+  EXPECT_TRUE(result.records[0].dispatched);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
+  EXPECT_TRUE(result.records[1].dispatched);
+  EXPECT_EQ(result.records[1].status,
+            static_cast<std::int32_t>(stream_terminate::ERROR));
+  ASSERT_EQ(result.request_status_log.size(), 2u);
+  EXPECT_EQ(result.request_status_log[0],
+            static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
+  EXPECT_EQ(result.request_status_log[1],
+            static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
+  EXPECT_EQ(responder.arrivals(),
+            (std::vector<std::uint32_t>{
+                cudaq::qec::decoding::rpc::kResetDecoderFunctionId}));
+  EXPECT_TRUE(responder.sent_bad_magic());
+  EXPECT_TRUE(responder.sent_unknown_id());
+}
+
+TEST(UdpBackendAdvanced,
      MaxFrameBytesIsTheMaxUdpDatagramPayloadNotZeroOrUnbounded) {
   // No listener needed: connect() on a UDP socket just records the default
   // destination, it doesn't require a live peer.
@@ -465,6 +649,34 @@ TEST(UdpBackendAdvanced,
                std::invalid_argument);
 }
 
+TEST(UdpBackendAdvanced,
+     DestructorJoinsReceiverWhenLaterSessionStartupThrows) {
+  class throwing_start_session final : public session {
+  public:
+    void start(run_ctx &) override {
+      throw std::runtime_error("test session startup failure");
+    }
+    void send(const frame &, tag) override {}
+    void event_done(std::uint32_t, std::uint32_t, std::int32_t, bool) override {
+    }
+    void stop(std::chrono::nanoseconds) override {}
+  };
+
+  auto sessions = make_udp_sessions(
+      std::unordered_map<std::uint64_t, std::string>{{0, closed_loopback_endpoint()}},
+      50);
+  ASSERT_EQ(sessions.size(), 1u);
+  sessions.emplace_back(1, std::make_unique<throwing_start_session>());
+  std::unordered_map<std::uint64_t, session *> router{
+      {0, sessions[0].second.get()}, {1, sessions[1].second.get()}};
+  auto sched = parse("0 reset session=0\n0 reset session=1\n", {0, 1}, 1000);
+  auto prepared = plan(sched, router, {}, {});
+
+  EXPECT_THROW(run(prepared), std::runtime_error);
+  prepared.reset();
+  sessions.clear();
+}
+
 TEST(UdpBackendAdvanced, SubmitRejectsAFrameShorterThanAnRPCHeader) {
   auto endpoint = closed_loopback_endpoint();
   auto sessions = make_udp_sessions(
@@ -475,6 +687,19 @@ TEST(UdpBackendAdvanced, SubmitRejectsAFrameShorterThanAnRPCHeader) {
   std::vector<std::uint8_t> short_frame(sizeof(RPCHeader) - 1, 0);
   frame f{short_frame.data(), short_frame.size()};
   EXPECT_THROW(sess->send(f, {}), std::invalid_argument);
+}
+
+TEST(UdpBackendAdvanced, BroadcastDestinationConnectFailureIsReported) {
+  const std::string endpoint = "255.255.255.255:9";
+  try {
+    auto sessions = make_udp_sessions({{0, endpoint}}, /*timeout_ms=*/50);
+    FAIL() << "connecting a UDP socket to the limited broadcast address "
+              "should fail";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string(error.what()).find("failed to connect to '" +
+                                             endpoint + "'"),
+              std::string::npos);
+  }
 }
 
 // ─── CpuRoceBackend ─────────────────────────────────────────────────────────
@@ -564,10 +789,12 @@ class recording_roce_server {
 public:
   recording_roce_server(const std::string &device, const std::string &ip,
                         std::chrono::milliseconds decode_time, bool reply,
-                        std::chrono::milliseconds settle)
-      : decode_time_(decode_time), settle_(settle), reply_(reply), ip_(ip) {
+                        std::chrono::milliseconds settle,
+                        std::uint32_t num_slots, std::uint32_t slot_size)
+      : decode_time_(decode_time), settle_(settle), num_slots_(num_slots),
+        reply_(reply), ip_(ip) {
     xcvr_ = cpu_roce_create_transceiver(
-        device.c_str(), 1, 0u, kRoceSlotSize, kRoceSlotSize, kRoceSlots,
+        device.c_str(), 1, 0u, slot_size, slot_size, num_slots_,
         "0.0.0.0", 0, 0, 0, 0, CPU_ROCE_TX_MODE_RDMA_SEND, 0, 0);
     if (!xcvr_)
       throw std::runtime_error("recording_roce_server: create failed");
@@ -659,7 +886,7 @@ private:
       __atomic_store_n(&rx_flags[slot], 0ull, __ATOMIC_RELEASE);
       if (is_read)
         std::this_thread::sleep_for(settle_);
-      slot = (slot + 1) % kRoceSlots;
+      slot = (slot + 1) % num_slots_;
     }
   }
 
@@ -667,6 +894,7 @@ private:
   int listen_fd_ = -1;
   std::string endpoint_;
   std::chrono::milliseconds decode_time_, settle_;
+  std::uint32_t num_slots_;
   bool reply_;
   std::string ip_;
   mutable std::mutex mu_;
@@ -695,11 +923,13 @@ protected:
 
   void connect(std::chrono::milliseconds decode_time = kDecodeTime,
                bool reply = true, std::uint32_t timeout_ms = 5000,
-               std::chrono::milliseconds settle = {}) {
+               std::chrono::milliseconds settle = {},
+               std::uint32_t num_slots = kRoceSlots) {
+    opts.num_slots = num_slots;
     server = std::make_unique<recording_roce_server>(
         env_or_empty("CUDAQ_CPU_ROCE_TEST_DAEMON_DEVICE"),
         env_or_empty("CUDAQ_CPU_ROCE_TEST_DAEMON_IP"), decode_time, reply,
-        settle);
+        settle, opts.num_slots, opts.slot_size);
     sessions =
         make_cpu_roce_sessions({{0, server->endpoint()}}, opts, timeout_ms);
     router = {{0, sessions[0].second.get()}};
@@ -746,6 +976,70 @@ TEST_F(CpuRoceBackend, AWaitingReadDoesNotHoldBackTheNextRound) {
   EXPECT_EQ(read.correction_count, 1u);
 }
 
+TEST_F(CpuRoceBackend, SmallAndLargeEnqueueFramesExerciseInlineAndOverflow) {
+  opts.slot_size = 512;
+  connect();
+  static_source src({{1}, std::vector<std::uint8_t>(2048, 1)});
+  auto result = run_schedule("0 stream source=0 rounds=2\n", {{0, &src}});
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(stream_terminate::OK));
+  EXPECT_EQ(result.records[0].rounds_streamed, 2u);
+  EXPECT_EQ(server->arrivals(),
+            (std::vector<std::uint32_t>{kEnqueueSyndromesFunctionId,
+                                        kEnqueueSyndromesFunctionId}));
+}
+
+TEST_F(CpuRoceBackend, OneInflightWindowQueuesAndCompletesReads) {
+  connect(std::chrono::milliseconds(30), /*reply=*/true,
+          /*timeout_ms=*/5000, /*settle=*/{}, /*num_slots=*/2);
+  auto result = run_schedule(reads(3));
+
+  ASSERT_EQ(result.records.size(), 3u);
+  for (const auto &record : result.records) {
+    EXPECT_EQ(record.status, static_cast<std::int32_t>(RpcStatus::OK));
+    EXPECT_TRUE(record.read_completed);
+  }
+  EXPECT_EQ(server->arrivals(),
+            (std::vector<std::uint32_t>{kGetCorrectionsFunctionId,
+                                        kGetCorrectionsFunctionId,
+                                        kGetCorrectionsFunctionId}));
+}
+
+TEST_F(CpuRoceBackend, EmptySourceRunStopsAndDestroysSession) {
+  connect();
+  static_source src(std::vector<std::vector<std::uint8_t>>{});
+  auto sched = parse("0 stream source=0\n", {0}, 1000);
+  run_params params;
+  params.lead_in_ns = 0;
+  auto result = run(plan(sched, router, {{0, &src}}, params));
+
+  EXPECT_EQ(result.records.size(), 1u);
+  if (result.records.size() == 1) {
+    EXPECT_EQ(result.records[0].status,
+              static_cast<std::int32_t>(stream_terminate::SOURCE_EXHAUSTED));
+    EXPECT_EQ(result.records[0].rounds_streamed, 0u);
+  }
+  EXPECT_TRUE(result.warnings.empty());
+  EXPECT_TRUE(server->arrivals().empty());
+
+  sessions.clear();
+}
+
+TEST_F(CpuRoceBackend, SourceExhaustionAfterOneRoundPreservesTerminalStatus) {
+  connect();
+  static_source src(std::vector<std::vector<std::uint8_t>>{{1}});
+  auto result = run_schedule("0 stream source=0\n", {{0, &src}});
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(stream_terminate::SOURCE_EXHAUSTED));
+  EXPECT_EQ(result.records[0].rounds_streamed, 1u);
+  EXPECT_EQ(server->arrivals(),
+            (std::vector<std::uint32_t>{kEnqueueSyndromesFunctionId}));
+}
+
 TEST_F(CpuRoceBackend, MoreRequestsThanSlotsWaitTheirTurnAndAllComplete) {
   // A 24-round stream and 12 slow reads through 8 slots wrap the ring: the
   // extra queue locally, go out as slots free up, and still arrive in order.
@@ -785,6 +1079,37 @@ TEST_F(CpuRoceBackend, AFullRingBehindADeadServerStillFailsEveryRequest) {
   EXPECT_EQ(server->arrivals().size(), 12u);
 }
 
+TEST_F(CpuRoceBackend, StopDrainExpiresWithInflightAndQueuedRequests) {
+  connect(std::chrono::milliseconds(1), /*reply=*/false,
+          /*timeout_ms=*/5000);
+  auto scheduled = plan(parse("0 reset\n" + reads(11), {0}, 1000), router, {},
+                        {});
+  scheduled->params.ack_drain_timeout_ns = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  auto result = run(scheduled);
+  EXPECT_LT(ms_since(t0), 2000);
+  ASSERT_EQ(result.records.size(), 12u);
+  for (const auto &record : result.records)
+    EXPECT_EQ(record.status,
+              static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
+  EXPECT_LT(server->arrivals().size(), result.records.size());
+}
+
+TEST_F(CpuRoceBackend, StopDrainPollsUnansweredRequest) {
+  connect(std::chrono::milliseconds(1), /*reply=*/false,
+          /*timeout_ms=*/5000);
+  auto scheduled = plan(parse(reads(1), {0}, 1000), router, {}, {});
+  scheduled->params.ack_drain_timeout_ns = 50'000'000;
+
+  auto result = run(scheduled);
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
+  EXPECT_EQ(server->arrivals(),
+            (std::vector<std::uint32_t>{kGetCorrectionsFunctionId}));
+}
+
 TEST_F(CpuRoceBackend, ALateReplyAfterATimeoutAndRingWrapFreesNoOtherSlot) {
   // A late reply to a request that already timed out must not free that
   // request's TX slot: the slot has since been reused by a newer request,
@@ -805,6 +1130,32 @@ TEST_F(CpuRoceBackend, ALateReplyAfterATimeoutAndRingWrapFreesNoOtherSlot) {
         << "record " << i;
 }
 
+TEST_F(CpuRoceBackend, StaggeredTimeoutLateReplyAndDrain) {
+  connect(std::chrono::milliseconds(300), /*reply=*/true,
+          /*timeout_ms=*/200);
+  std::string text = "0 get_corrections return_size=1\n150 reset\n";
+  for (int i = 0; i < 10; ++i)
+    text += "+0 reset\n";
+  auto scheduled = plan(parse(text, {0}, 1'000'000), router, {}, {});
+  scheduled->params.ack_drain_timeout_ns = 1'000'000'000;
+
+  auto result = run(scheduled);
+  ASSERT_EQ(result.records.size(), 12u);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(RpcStatus::INTERNAL_ERROR));
+  EXPECT_TRUE(std::any_of(result.records.begin() + 1, result.records.end(),
+                          [](const auto &record) {
+                            return record.status ==
+                                   static_cast<std::int32_t>(RpcStatus::OK);
+                          }));
+  const auto arrivals = server->arrivals();
+  EXPECT_NE(std::find(arrivals.begin(), arrivals.end(),
+                      kGetCorrectionsFunctionId),
+            arrivals.end());
+  EXPECT_NE(std::find(arrivals.begin(), arrivals.end(), kResetDecoderFunctionId),
+            arrivals.end());
+}
+
 TEST_F(CpuRoceBackend, MaxFrameBytesIsTheSlotSizeAndBadFramesAreRejected) {
   connect();
   EXPECT_EQ(sessions[0].second->max_frame_bytes, kRoceSlotSize);
@@ -821,6 +1172,57 @@ TEST_F(CpuRoceBackend, MaxFrameBytesIsTheSlotSizeAndBadFramesAreRejected) {
   EXPECT_THROW(
       sessions[0].second->send({short_frame.data(), short_frame.size()}, {}),
       std::invalid_argument);
+}
+
+TEST_F(CpuRoceBackend, SingleSlotRingCompletesRequest) {
+  opts.num_slots = 1;
+  connect(/*decode_time=*/kDecodeTime, /*reply=*/true,
+          /*timeout_ms=*/5000, /*settle=*/{},
+          /*num_slots=*/opts.num_slots);
+
+  auto result = run_schedule("0 reset\n");
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(result.records[0].status, static_cast<std::int32_t>(RpcStatus::OK));
+  const auto arrivals = server->arrivals();
+  ASSERT_EQ(arrivals.size(), 1u);
+  EXPECT_EQ(arrivals[0], kResetDecoderFunctionId);
+}
+
+TEST_F(CpuRoceBackend,
+       FactoryCleansPartialConnectionsAndConstructsSessions) {
+  {
+    recording_roce_server server(
+        env_or_empty("CUDAQ_CPU_ROCE_TEST_DAEMON_DEVICE"),
+        env_or_empty("CUDAQ_CPU_ROCE_TEST_DAEMON_IP"), kDecodeTime,
+        /*reply=*/true, /*settle=*/{}, opts.num_slots, opts.slot_size);
+    std::string refused_endpoint;
+    ::close(listen_loopback_tcp(refused_endpoint));
+
+    EXPECT_THROW(make_cpu_roce_sessions(
+                     {{7, server.endpoint()}, {19, refused_endpoint}}, opts),
+                 std::runtime_error);
+  }
+
+  recording_roce_server server(
+      env_or_empty("CUDAQ_CPU_ROCE_TEST_DAEMON_DEVICE"),
+      env_or_empty("CUDAQ_CPU_ROCE_TEST_DAEMON_IP"), kDecodeTime,
+      /*reply=*/true, /*settle=*/{}, opts.num_slots, opts.slot_size);
+  auto sessions =
+      make_cpu_roce_sessions({{23, server.endpoint()}}, opts);
+  ASSERT_EQ(sessions.size(), 1u);
+  EXPECT_EQ(sessions[0].first, 23u);
+  EXPECT_NE(sessions[0].second.get(), nullptr);
+}
+
+TEST_F(CpuRoceBackend,
+       AnUnresolvableRendezvousHostFailsBeforeAnyTcpConnect) {
+  try {
+    make_cpu_roce_sessions({{0, "invalid host:1"}}, opts);
+    FAIL() << "expected the malformed rendezvous host to fail resolution";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string(error.what()).find("failed to resolve rendezvous"),
+              std::string::npos);
+  }
 }
 
 TEST_F(CpuRoceBackend,
@@ -874,6 +1276,193 @@ decoders:
   EXPECT_EQ(result.records[1].op, operation::get_logical_measurements);
   EXPECT_EQ(result.records[1].status,
             static_cast<std::int32_t>(RpcStatus::BAD_REQUEST));
+}
+
+TEST(InprocBackend, StopsStartedWorkerAfterSingleReset) {
+  const auto config =
+      cudaq::qec::decoding::config::multi_decoder_config::from_yaml_str(R"(
+decoders:
+  - id: 0
+    type: single_error_lut
+    block_size: 3
+    syndrome_size: 3
+    H_sparse: [0,-1,1,-1,2,-1]
+    O_sparse: [0,-1,1,-1,2,-1]
+    D_sparse: [0,-1,1,-1,2,-1]
+)");
+  auto sessions = make_inproc_sessions(config);
+  std::unordered_map<std::uint64_t, session *> router;
+  for (auto &[id, s] : sessions)
+    router[id] = s.get();
+
+  auto sched = parse("0 reset\n", {0}, 1000);
+  auto result = run(plan(sched, router, {}, {}));
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_TRUE(result.records[0].dispatched);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(RpcStatus::OK));
+  ASSERT_EQ(result.request_status_log.size(), 1u);
+  EXPECT_EQ(result.request_status_log[0],
+            static_cast<std::int32_t>(RpcStatus::OK));
+}
+
+TEST(InprocBackend,
+     DestructorStopsStartedWorkerAfterLaterSessionStartupThrows) {
+  class throwing_start_session final : public session {
+  public:
+    void start(run_ctx &) override {
+      throw std::runtime_error("test session startup failure");
+    }
+    void send(const frame &, tag) override {}
+    void event_done(std::uint32_t, std::uint32_t, std::int32_t, bool) override {}
+    void stop(std::chrono::nanoseconds) override {}
+  };
+
+  const auto config =
+      cudaq::qec::decoding::config::multi_decoder_config::from_yaml_str(R"(
+decoders:
+  - id: 0
+    type: single_error_lut
+    block_size: 3
+    syndrome_size: 3
+    H_sparse: [0,-1,1,-1,2,-1]
+    O_sparse: [0,-1,1,-1,2,-1]
+    D_sparse: [0,-1,1,-1,2,-1]
+)");
+  auto sessions = make_inproc_sessions(config);
+  sessions.emplace_back(1, std::make_unique<throwing_start_session>());
+  std::unordered_map<std::uint64_t, session *> router;
+  for (auto &[id, s] : sessions)
+    router[id] = s.get();
+
+  auto sched = parse("0 reset\n0 reset session=1\n", {0, 1}, 1000);
+  auto prepared = plan(sched, router, {}, {});
+  EXPECT_THROW(run(prepared), std::runtime_error);
+
+  prepared.reset();
+  sessions.clear();
+}
+
+TEST(InprocBackend, RequestRingCapacityBurst) {
+  const auto config =
+      cudaq::qec::decoding::config::multi_decoder_config::from_yaml_str(R"(
+decoders:
+  - id: 0
+    type: single_error_lut
+    block_size: 3
+    syndrome_size: 3
+    H_sparse: [0,-1,1,-1,2,-1]
+    O_sparse: [0,-1,1,-1,2,-1]
+    D_sparse: [0,-1,1,-1,2,-1]
+)");
+  auto sessions = make_inproc_sessions(config);
+  std::unordered_map<std::uint64_t, session *> router;
+  for (auto &[id, s] : sessions)
+    router[id] = s.get();
+  auto sched = parse("0 stream source=0b000 rounds=8192\n", {0}, 1000);
+  auto result = run(plan(sched, router, {}, {}));
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_TRUE(result.records[0].dispatched);
+  EXPECT_EQ(result.records[0].rounds_streamed, 8192u);
+  ASSERT_EQ(result.request_status_log.size(), 8192u);
+  for (const auto status : result.request_status_log)
+    EXPECT_EQ(status, static_cast<std::int32_t>(RpcStatus::OK));
+}
+
+TEST(InprocBackend, MalformedPlannedFramesAreRejectedByRpcDispatch) {
+  const auto config =
+      cudaq::qec::decoding::config::multi_decoder_config::from_yaml_str(R"(
+decoders:
+  - id: 0
+    type: single_error_lut
+    block_size: 3
+    syndrome_size: 3
+    H_sparse: [0,-1,1,-1,2,-1]
+    O_sparse: [0,-1,1,-1,2,-1]
+    D_sparse: [0,-1,1,-1,2,-1]
+)");
+  const auto run_case = [&](const char *schedule_text, bool has_source,
+                            auto corrupt_frame,
+                            std::vector<std::uint8_t> source_round = {1, 0, 1},
+                            bool expect_oversized_frame = false) {
+    auto sessions = make_inproc_sessions(config);
+    std::unordered_map<std::uint64_t, session *> router;
+    for (auto &[id, s] : sessions)
+      router[id] = s.get();
+    static_source source({source_round});
+    std::unordered_map<std::uint32_t, syndrome_source *> sources;
+    if (has_source)
+      sources.emplace(0, &source);
+
+    auto scheduled = plan(parse(schedule_text, {0}, 1000), router, sources, {});
+    if (expect_oversized_frame)
+      EXPECT_GT(scheduled->event_plans[0][0].frame_len, 256u);
+    auto *frame_bytes =
+        scheduled->frame_arena.data() +
+        scheduled->event_plans[0][0].frame_offset;
+    corrupt_frame(frame_bytes);
+    return run(scheduled);
+  };
+  const auto set_arg_len = [](std::uint8_t *frame_bytes,
+                              std::uint32_t arg_len) {
+    RPCHeader header{};
+    std::memcpy(&header, frame_bytes, sizeof(header));
+    header.arg_len = arg_len;
+    std::memcpy(frame_bytes, &header, sizeof(header));
+  };
+  const auto expect_bad_request = [](const run_result &result) {
+    ASSERT_EQ(result.records.size(), 1u);
+    EXPECT_TRUE(result.records[0].dispatched);
+    ASSERT_EQ(result.request_status_log.size(), 1u);
+    EXPECT_EQ(result.request_status_log[0],
+              static_cast<std::int32_t>(RpcStatus::BAD_REQUEST));
+  };
+
+  expect_bad_request(run_case(
+      "0 enqueue_data source=0\n", true, [&](std::uint8_t *frame_bytes) {
+        set_arg_len(frame_bytes, 0);
+      },
+      std::vector<std::uint8_t>(2048), true));
+  expect_bad_request(run_case(
+      "0 enqueue_data source=0\n", true, [](std::uint8_t *frame_bytes) {
+        cudaq::qec::decoding::rpc::EnqueueRequestPayload payload{};
+        auto *payload_bytes = frame_bytes + sizeof(RPCHeader);
+        std::memcpy(&payload, payload_bytes, sizeof(payload));
+        payload.num_syndromes = 0;
+        std::memcpy(payload_bytes, &payload, sizeof(payload));
+      }));
+  expect_bad_request(run_case(
+      "0 enqueue_data source=0\n", true, [](std::uint8_t *frame_bytes) {
+        cudaq::qec::decoding::rpc::EnqueueRequestPayload payload{};
+        auto *payload_bytes = frame_bytes + sizeof(RPCHeader);
+        std::memcpy(&payload, payload_bytes, sizeof(payload));
+        payload.syndrome_mapping_id =
+            std::numeric_limits<std::int64_t>::max();
+        std::memcpy(payload_bytes, &payload, sizeof(payload));
+      }));
+  expect_bad_request(run_case(
+      "0 get_corrections return_size=1\n", false,
+      [&](std::uint8_t *frame_bytes) {
+        set_arg_len(frame_bytes,
+                    static_cast<std::uint32_t>(sizeof(std::uint64_t)));
+      }));
+  expect_bad_request(run_case(
+      "0 get_logical_measurements return_size=1\n", false,
+      [&](std::uint8_t *frame_bytes) {
+        set_arg_len(frame_bytes,
+                    static_cast<std::uint32_t>(sizeof(std::uint64_t)));
+      }));
+  expect_bad_request(run_case("0 reset\n", false, [&](std::uint8_t *frame_bytes) {
+    set_arg_len(frame_bytes, 0);
+  }));
+  expect_bad_request(run_case("0 reset\n", false, [](std::uint8_t *frame_bytes) {
+    RPCHeader header{};
+    std::memcpy(&header, frame_bytes, sizeof(header));
+    header.function_id = std::numeric_limits<std::uint32_t>::max();
+    std::memcpy(frame_bytes, &header, sizeof(header));
+  }));
 }
 
 // A windowed graph with a final readout answers a mid-shot logical read

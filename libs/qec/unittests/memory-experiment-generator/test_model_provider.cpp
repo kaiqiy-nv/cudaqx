@@ -366,6 +366,18 @@ TEST(MemoryExperimentProvider, PreparedGeometryIsCheckedAgainstCode) {
   }
 }
 
+TEST(MemoryExperimentProvider, FinalReadoutSupportEnumeratesSetBits) {
+  cudaqx::tensor<std::uint8_t> observables({3, 5});
+  observables.at({0, 0}) = 1;
+  observables.at({0, 3}) = 1;
+  observables.at({2, 1}) = 1;
+  observables.at({2, 4}) = 1;
+
+  const std::vector<std::vector<std::uint64_t>> expected{
+      {0, 3}, {}, {1, 4}};
+  EXPECT_EQ(final_readout_support(observables), expected);
+}
+
 TEST(MemoryExperimentProvider, PublicReadoutAgreesWithTerminalMeasurements) {
   for (const auto basis : {memory_basis::x, memory_basis::z}) {
     const preparation_request request{{"surface_code", 3, 26, 1, basis}};
@@ -408,6 +420,17 @@ TEST(MemoryExperimentProvider, PublicReadoutAgreesWithTerminalMeasurements) {
     EXPECT_THROW(validate_final_readout(chunks, model.final_m2o),
                  std::invalid_argument);
   }
+}
+
+TEST(MemoryExperimentProvider, EmptyReadoutHasEmptySparseEncoding) {
+  const auto terminal = phase_id::from_name("empty_readout_terminal");
+  dem_chunks_spec chunks;
+  chunks.phases.push_back({terminal, {}});
+  chunks.connections.push_back({terminal, terminal});
+  chunks.num_rounds = 2;
+  const std::vector<std::vector<std::uint64_t>> readout;
+
+  EXPECT_NO_THROW(validate_final_readout(chunks, readout));
 }
 
 TEST(MemoryExperimentProvider, RejectsWrongReadoutAndObservableCount) {

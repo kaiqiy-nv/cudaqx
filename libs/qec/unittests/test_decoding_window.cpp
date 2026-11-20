@@ -845,6 +845,25 @@ std::vector<uint8_t> apply_map(const affine_map &map,
   return out;
 }
 
+TEST(DecodingWindow, M2dLayoutUsesPreviousRoundWidth) {
+  const auto tmpl =
+      std::make_shared<const experiment_template>(widening_spec(true));
+  constexpr std::size_t R = 8;
+  window_request request;
+  request.period = 1;
+  request.offset = 1;
+  request.commit = round_range{0, 1};
+  request.input = {port_disposition::closed, std::nullopt};
+  request.output = {port_disposition::open, std::nullopt};
+
+  const auto w = window_from_dem_chunks(tmpl, request, 0, R);
+  ASSERT_EQ(w.rounds, (round_range{1, 2}));
+  EXPECT_EQ(w.num_virtual_outcomes, 2u);
+  EXPECT_EQ(w.num_measurements, 4u);
+  EXPECT_EQ(apply_map(w.m2d, {1, 0, 1, 1, 0, 1}),
+            (std::vector<uint8_t>{0, 1, 0, 1, 1, 1, 0, 1}));
+}
+
 // m2d applied to a shot's measurements gives the shot's detectors on the
 // window's own rows, then the virtual outcomes on the commit zone's outgoing
 // wire and on the output port, with or without explicit D rows, and across
@@ -934,6 +953,51 @@ TEST(DecodingWindow, M2dRecurrenceGivesTheIncomingVirtualOutcomes) {
   }
 } // end - TEST(DecodingWindow, M2dRecurrenceGivesTheIncomingVirtualOutcomes)
 
+TEST(DecodingWindow, M2dRejectsMalformedDSparse) {
+  const auto request = layered(2, 2, 3).b;
+  constexpr std::size_t R = 9;
+  const auto k = window_instances(request, R).begin;
+
+  auto past_round = arbitrary_memory_spec(5, true);
+  phase_of(past_round, phase_name::dem_bulk).D_sparse[0] = 8;
+  std::shared_ptr<const experiment_template> past_context;
+  ASSERT_NO_THROW(past_context =
+                      std::make_shared<const experiment_template>(past_round));
+  expect_error(
+      [&] { window_from_dem_chunks(past_context, request, k, R); },
+      "past its round");
+
+  auto missing_rows = arbitrary_memory_spec(5, true);
+  phase_of(missing_rows, phase_name::dem_bulk).D_sparse = {0, 4, -1};
+  std::shared_ptr<const experiment_template> rows_context;
+  ASSERT_NO_THROW(rows_context = std::make_shared<const experiment_template>(
+                      missing_rows));
+  expect_error(
+      [&] { window_from_dem_chunks(rows_context, request, k, R); },
+      "has 1 rows");
+} // end - TEST(DecodingWindow, M2dRejectsMalformedDSparse)
+
+TEST(DecodingWindow, M2dCancelsRepeatedInputs) {
+  auto spec = arbitrary_memory_spec(5, true);
+  auto &bulk = phase_of(spec, phase_name::dem_bulk);
+  const auto repeated_source = bulk.D_sparse.front();
+  bulk.D_sparse.insert(bulk.D_sparse.begin() + 1, repeated_source);
+  const auto tmpl = std::make_shared<const experiment_template>(spec);
+  const std::size_t R = 9;
+  const auto request = layered(2, 2, 3).b;
+  const auto instances = window_instances(request, R);
+  const auto w = window_from_dem_chunks(tmpl, request, instances.begin, R);
+
+  ASSERT_EQ(w.rounds.begin, 2);
+  ASSERT_EQ(w.m2d.input_sizes.size(), 2u);
+  std::vector<uint8_t> input(w.m2d.input_sizes[0] + w.m2d.input_sizes[1], 0);
+  input[0] = 1;
+  EXPECT_EQ(apply_map(w.m2d, input).front(), 0);
+  input[0] = 0;
+  input[w.m2d.input_sizes[0]] = 1;
+  EXPECT_EQ(apply_map(w.m2d, input).front(), 1);
+} // end - TEST(DecodingWindow, M2dCancelsRepeatedInputs)
+
 // m2o, when requested, reads the readout records of the last round.
 TEST(DecodingWindow, M2oReadsTheReadoutRound) {
   const auto tmpl =
@@ -958,6 +1022,21 @@ TEST(DecodingWindow, M2oReadsTheReadoutRound) {
   expect_error([&] { window_from_dem_chunks(tmpl, b, 1, R, true); },
                "readout round");
 } // end - TEST(DecodingWindow, M2oReadsTheReadoutRound)
+
+TEST(DecodingWindow, M2oRequiresLastPhaseReadout) {
+  auto spec = wide_readout_spec();
+  phase_of(spec, phase_name::dem_final).m2o_sparse.clear();
+  const auto tmpl = std::make_shared<const experiment_template>(spec);
+  const std::size_t R = 9;
+  const auto request = layered(2, 2, 3).b;
+  const auto instances = window_instances(request, R);
+
+  expect_error(
+      [&] {
+        window_from_dem_chunks(tmpl, request, instances.end - 1, R, true);
+      },
+      "needs the last phase's m2o_sparse");
+} // end - TEST(DecodingWindow, M2oRequiresLastPhaseReadout)
 
 // A template that reads an observable mid-circuit has no window m2o: no
 // window holding the readout round also holds the earlier reading round. The
@@ -1115,6 +1194,33 @@ TEST(DecodingWindow, RejectsInvalidRequests) {
     expect_error([&] { window_from_dem_chunks(tmpl, good, k, 12); },
                  "has no commit round");
 } // end - TEST(DecodingWindow, RejectsInvalidRequests)
+
+TEST(DecodingWindow, RejectsEmptyRangesAndHandlesUnorderedZones) {
+  const auto tmpl =
+      std::make_shared<const experiment_template>(arbitrary_memory_spec(5));
+  const auto rejects = [&](window_request request, const std::string &text) {
+    expect_error([&] { window_from_dem_chunks(tmpl, request, 1, 12); }, text);
+  };
+
+  const auto valid = layered(2, 2, 3).a;
+  auto unordered = valid;
+  unordered.buffers = {valid.buffers[1], valid.buffers[0]};
+  const auto window = window_from_dem_chunks(tmpl, unordered, 1, 12);
+  EXPECT_EQ(window.rounds.begin, 3);
+  EXPECT_EQ(window.rounds.end, 9);
+
+  auto request = valid;
+  request.buffers[0] = {-2, -2};
+  rejects(request, "a buffer zone is empty");
+
+  request = valid;
+  request.sends.push_back({"empty", send_mode::delta, {{1, 1}}});
+  rejects(request, "send 'empty' has an empty round range");
+
+  request = layered(2, 2, 3).b;
+  request.output.imports = round_range{3, 3};
+  rejects(request, "the imports are empty");
+} // end - TEST(DecodingWindow, RejectsEmptyRangesAndHandlesUnorderedZones)
 
 // ---------------------------------------------------------------------------
 // Column-handling options
@@ -1397,6 +1503,60 @@ TEST(DecodingWindowColumns, TruncateMatchesGetPcmForRounds) {
   } // end - for(k)
 } // end - TEST(DecodingWindowColumns, TruncateMatchesGetPcmForRounds)
 
+TEST(DecodingWindowColumns, TruncatedVariableWidthCrossingsMatchWholeShot) {
+  const auto spec = narrow_readout_spec();
+  const auto tmpl = std::make_shared<const experiment_template>(spec);
+  const std::size_t R = 15;
+  const auto shot = make_whole_shot(spec, R);
+  auto request = layered(2, 2, 3).a;
+  request.input = {port_disposition::open, std::nullopt,
+                   input_boundary::truncate};
+  const auto instances = window_instances(request, R);
+  std::size_t interior_windows_with_crossings = 0;
+  for (auto k = instances.begin; k < instances.end; ++k) {
+    const auto w = window_from_dem_chunks(tmpl, request, k, R);
+    if (w.rounds.begin == 0)
+      continue;
+
+    const auto model = dense(w);
+    const auto &h = model.detector_error_matrix;
+    auto rows = rows_of(shot, w.rounds);
+    const auto imports = rows_of(shot, w.output.imports);
+    rows.insert(rows.end(), imports.begin(), imports.end());
+    std::vector<std::vector<uint8_t>> projected(rows.size());
+    std::size_t projected_column_count = 0;
+    for (auto c = shot.column[w.rounds.begin - 1];
+         c < shot.column[w.rounds.begin]; ++c) {
+      std::vector<uint8_t> column;
+      bool nonempty = false;
+      for (const auto r : rows) {
+        const auto value = shot.model.detector_error_matrix.at({r, c});
+        column.push_back(value);
+        nonempty |= value != 0;
+      }
+      if (!nonempty)
+        continue;
+      ++projected_column_count;
+      for (std::size_t r = 0; r < rows.size(); ++r)
+        projected[r].push_back(column[r]);
+    }
+
+    SCOPED_TRACE("k=" + std::to_string(k));
+    EXPECT_EQ(w.num_crossing_columns, projected_column_count);
+    ASSERT_EQ(h.shape()[0], projected.size());
+    ASSERT_LE(w.num_fault_columns + projected_column_count, h.shape()[1]);
+    std::vector<std::vector<uint8_t>> actual(rows.size());
+    for (std::size_t r = 0; r < rows.size(); ++r)
+      for (std::size_t c = 0; c < projected_column_count; ++c)
+        actual[r].push_back(h.at({r, w.num_fault_columns + c}));
+    EXPECT_EQ(actual, projected);
+    if (projected_column_count > 0)
+      ++interior_windows_with_crossings;
+  } // end - for(k)
+  EXPECT_GT(interior_windows_with_crossings, 0u);
+} // end - TEST(DecodingWindowColumns,
+  // TruncatedVariableWidthCrossingsMatchWholeShot)
+
 // Truncated crossing columns never merge, even when identical in the window.
 TEST(DecodingWindowColumns, TruncatedColumnsNeverMerge) {
   const auto tmpl =
@@ -1463,6 +1623,35 @@ TEST(WindowVariants, CountMatchesTheLayout) {
   }
 }
 
+TEST(VariantInstances, EnumeratesUniqueKeysAtFirstOccurrence) {
+  const experiment_template context(arbitrary_memory_spec(5));
+  const auto request = layered(2, 2, 3).a;
+  const auto probe_rounds = variant_probe_rounds(context, request);
+  std::vector<variant_instance> expected;
+  std::set<variant_key> seen;
+  for (auto R = context.min_rounds(); R < probe_rounds; ++R) {
+    const auto instances = window_instances(request, R);
+    for (auto k = instances.begin; k < instances.end; ++k) {
+      const auto key = window_variant(context, request, k, R);
+      if (seen.insert(key).second)
+        expected.push_back({key, k, R});
+    }
+  }
+
+  const auto actual = variant_instances(context, request);
+  ASSERT_EQ(actual.size(), expected.size());
+  std::set<variant_key> actual_keys;
+  for (std::size_t i = 0; i < actual.size(); ++i) {
+    EXPECT_EQ(actual[i].key, expected[i].key);
+    EXPECT_EQ(actual[i].k, expected[i].k);
+    EXPECT_EQ(actual[i].num_rounds, expected[i].num_rounds);
+    EXPECT_TRUE(actual_keys.insert(actual[i].key).second);
+    EXPECT_EQ(window_variant(context, request, actual[i].k,
+                             actual[i].num_rounds),
+              actual[i].key);
+  }
+}
+
 // Windows with equal keys are the same problem up to a shift of rounds. A
 // key from bounds found once is the key window_variant() finds.
 TEST(WindowVariants, EqualKeysBuildTheSameWindow) {
@@ -1519,6 +1708,84 @@ TEST(WindowVariants, BulkWindowsAreTranslationInvariant) {
       },
       "windows 1 and 2 differ in their input port");
 } // end - TEST(WindowVariants, BulkWindowsAreTranslationInvariant)
+
+TEST(WindowVariants, ReportsShiftMismatchFieldsAndSkipsNonRepeatingTemplates) {
+  const auto context =
+      std::make_shared<const experiment_template>(arbitrary_memory_spec(5));
+  const auto request = layered(2, 2, 3).a;
+  const auto first = window_from_dem_chunks(context, request, 1, 20);
+  const auto second = window_from_dem_chunks(context, request, 2, 20);
+  EXPECT_NO_THROW(check_same_window_up_to_shift(first, second));
+
+  {
+    auto a = first;
+    auto b = second;
+    ++b.commit.begin;
+    expect_error([&] { check_same_window_up_to_shift(a, b); }, "their zones");
+  }
+  {
+    auto a = first;
+    auto b = second;
+    b.output.exists = !b.output.exists;
+    expect_error([&] { check_same_window_up_to_shift(a, b); },
+                 "their output port");
+  }
+  {
+    auto a = first;
+    auto b = second;
+    b.sends.push_back(b.sends.front());
+    expect_error([&] { check_same_window_up_to_shift(a, b); }, "their sends");
+  }
+  {
+    auto a = first;
+    auto b = second;
+    a.sends = {a.sends.front()};
+    b.sends = a.sends;
+    b.sends.front().id += "-different";
+    expect_error([&] { check_same_window_up_to_shift(a, b); }, "send 'forward'");
+  }
+  {
+    auto a = first;
+    auto b = second;
+    a.model.priors = {0.1};
+    b.model.priors = a.model.priors;
+    b.model.priors.front() = 0.2;
+    expect_error([&] { check_same_window_up_to_shift(a, b); }, "their model");
+  }
+  {
+    auto a = first;
+    auto b = second;
+    ++b.num_measurements;
+    expect_error([&] { check_same_window_up_to_shift(a, b); }, "their m2d");
+  }
+  {
+    auto a = first;
+    auto b = second;
+    b.m2o = b.m2d;
+    expect_error([&] { check_same_window_up_to_shift(a, b); }, "their m2o");
+  }
+
+  const auto nonrepeating =
+      std::make_shared<const experiment_template>(linear_spec());
+  EXPECT_FALSE(nonrepeating->repeats());
+  EXPECT_NO_THROW(check_translation_invariance(nonrepeating, request));
+}
+
+TEST(WindowVariants, ShiftedRangeVectorsPreserveEmptyEntries) {
+  const auto context =
+      std::make_shared<const experiment_template>(arbitrary_memory_spec(5));
+  const auto request = layered(2, 2, 3).a;
+  auto first = window_from_dem_chunks(context, request, 1, 20);
+  auto second = window_from_dem_chunks(context, request, 2, 20);
+
+  ASSERT_NE(first.rounds.begin, second.rounds.begin);
+  first.buffers = {round_range{},
+                   {first.rounds.begin + 1, first.rounds.begin + 3}};
+  second.buffers = {round_range{},
+                    {second.rounds.begin + 1, second.rounds.begin + 3}};
+
+  EXPECT_NO_THROW(check_same_window_up_to_shift(first, second));
+}
 
 // The model is in the kernel's forms: H over the decoder's columns and O
 // over every column, both canonical CSC, and a prior per column. The dense
@@ -1670,6 +1937,105 @@ void validate(const dem_chunks_spec &spec, const window_graph &g) {
         << layer.node << "'s windows are not in the store";
 } // end - validate()
 
+struct configured_window_topology {
+  std::vector<task_graph_node_config> nodes;
+  std::vector<task_graph_edge> edges;
+};
+
+configured_window_topology layered_window_topology() {
+  const auto requests = layered(2, 2, 3);
+  task_graph_node_config ingest;
+  ingest.id = "ingest";
+  ingest.kind = "ingest";
+  ingest.dem = arbitrary_memory_spec(5);
+  ingest.windows = {{"A", requests.a, ""}, {"B", requests.b, ""}};
+
+  task_graph_node_config a;
+  a.id = "A";
+  a.kind = "decode_window";
+  task_graph_node_config b;
+  b.id = "B";
+  b.kind = "decode_window";
+
+  configured_window_topology topology;
+  topology.nodes.push_back(std::move(ingest));
+  topology.nodes.push_back(std::move(a));
+  topology.nodes.push_back(std::move(b));
+  topology.edges = {{"measurements", "output", "ingest", "input"},
+                    {"ingest", "A", "A", "input"},
+                    {"ingest", "B", "B", "input"}};
+  return topology;
+}
+
+TEST(WindowTopology, RejectsInvalidBindings) {
+  const auto reject = [](const std::vector<task_graph_node_config> &nodes,
+                         const std::vector<task_graph_edge> &edges,
+                         const std::string &diagnostic) {
+    data_artifact_store store;
+    expect_error(
+        [&] { validate_window_topology(nodes, edges, store); },
+        "from_topology", diagnostic);
+  };
+
+  auto topology = layered_window_topology();
+  topology.edges.push_back({"A", "output", "ingest", "input"});
+  reject(topology.nodes, topology.edges,
+         "must be fed by measurements alone");
+
+  topology = layered_window_topology();
+  topology.nodes[0].dem.reset();
+  reject(topology.nodes, topology.edges, "has no dem_chunks template");
+
+  topology = layered_window_topology();
+  topology.edges.push_back({"ingest", "B", "A", "input"});
+  reject(topology.nodes, topology.edges,
+         "is fed by more than one window port");
+
+  topology = layered_window_topology();
+  topology.nodes[1].node_params.insert("num_receives", std::size_t{1});
+  topology.edges.push_back(
+      {"measurements", "output", "A", "receive_0"});
+  reject(topology.nodes, topology.edges,
+         "which is not a decode_window node");
+
+  topology = layered_window_topology();
+  topology.edges.erase(
+      std::find(topology.edges.begin(), topology.edges.end(),
+                task_graph_edge{"ingest", "A", "A", "input"}));
+  reject(topology.nodes, topology.edges,
+         "needs an input from a window port of an ingest node");
+}
+
+TEST(WindowTopology, BuildsAndValidatesLayeredBindings) {
+  auto topology = layered_window_topology();
+  topology.nodes[2].node_params.insert("num_receives", std::size_t{2});
+  topology.edges.push_back({"A", "forward", "B", "receive_0", -1});
+  topology.edges.push_back({"A", "backward", "B", "receive_1", 0});
+
+  data_artifact_store store;
+  const auto layers =
+      validate_window_topology(topology.nodes, topology.edges, store);
+  ASSERT_EQ(layers.size(), 1u);
+  const auto ingest = layers.find("ingest");
+  ASSERT_NE(ingest, layers.end());
+  ASSERT_EQ(ingest->second.size(), 2u);
+
+  const auto context = store.find_template(*topology.nodes[0].dem);
+  for (const auto &layer : ingest->second)
+    EXPECT_NO_THROW(store.find_windows(*context, layer.request))
+        << layer.node;
+}
+
+TEST(WindowCommitment, RejectsNullTemplate) {
+  const auto requests = layered(2, 2, 3);
+  const std::vector<window_layer> layers{{"A", "A", requests.a},
+                                         {"B", "B", requests.b}};
+  expect_error([&] { validate_commitment(nullptr, layers, {}); },
+               "validate_commitment: no template");
+  expect_error([&] { schedule_windows(nullptr, layers, {}, 20); },
+               "schedule_windows: no template");
+}
+
 // ---------------------------------------------------------------------------
 // Schedule
 // ---------------------------------------------------------------------------
@@ -1751,6 +2117,26 @@ TEST(WindowSchedule, RejectsUnknownNamesAndInvalidRequests) {
   g = parallel_graph(layered(2, 2, 3));
   g.layers[1].request.commit.reset();
   expect_error(schedule, "window request: no commit zone");
+}
+
+TEST(WindowSchedule, ZeroOffsetEdgeDiagnosticShowsEdgeWithoutOffset) {
+  const auto tmpl =
+      std::make_shared<const experiment_template>(arbitrary_memory_spec(5));
+  auto g = parallel_graph(layered(2, 2, 3));
+  g.edges[1].from_node = "missing";
+
+  std::string diagnostic;
+  try {
+    schedule_windows(tmpl, g.layers, g.edges, 10);
+  } catch (const std::invalid_argument &e) {
+    diagnostic = e.what();
+  }
+
+  EXPECT_NE(diagnostic.find("schedule_windows: edge missing.backward -> "
+                            "B.receive_1 names a node that is not a window "
+                            "layer"),
+            std::string::npos);
+  EXPECT_EQ(diagnostic.find("(index_offset 0)"), std::string::npos);
 }
 
 // The probe shots hold every variant key that any longer shot has, for
@@ -1891,6 +2277,15 @@ TEST(Commitment, SlidingWindowFinalizesEveryRowOnce) {
     expect_sound(arbitrary_memory_spec(5), sliding_graph(step, size));
 }
 
+TEST(Commitment, MinimalParallelLayoutIndexesHoldersAndCommitters) {
+  expect_sound(arbitrary_memory_spec(5),
+               parallel_graph(layered(1, 1, 1)));
+}
+
+TEST(Commitment, FixedThreePhaseShotFinalizesEveryRowOnce) {
+  expect_sound(linear_spec(), with_most_likely(sliding_graph(2, 5)));
+}
+
 // F1: B with an open input has a boundary column on its first round, where
 // A[k-1] has its trailing buffer, so no window finalizes the round.
 TEST(Commitment, RejectsARowWithoutAFinalizer) {
@@ -2013,6 +2408,16 @@ TEST(CommitmentSends, RejectsAResidualThatDiffersFromTheImports) {
       "[5, 7); round 6 differs");
 }
 
+TEST(CommitmentSends, JoinsDisjointResidualRangesInDiagnostics) {
+  auto requests = layered(2, 2, 3);
+  requests.a.sends[1] =
+      {"backward", send_mode::residual, {{-2, -1}, {0, 1}}};
+  expect_error(
+      [&] { validate(arbitrary_memory_spec(5), parallel_graph(requests)); },
+      "A[1]'s residual 'backward' covers rounds [3, 4), [5, 6), but B[1] "
+      "imports [5, 6); round 3 differs");
+}
+
 // Imports take their values from exactly one residual: a second residual
 // send over the same rounds is rejected.
 TEST(CommitmentSends, RejectsTwoResidualsForOneImport) {
@@ -2118,6 +2523,19 @@ TEST(CommitmentParallel, RejectsATwinInAnotherZone) {
       "validate_commitment: A[0]", "commit column", "in another zone");
 }
 
+TEST(CommitmentParallel, BulkVariantConflictIsNamed) {
+  auto spec = twin_spec(true);
+  auto &init = phase_of(spec, phase_name::dem_init);
+  for (auto &seam : init.seam_specs)
+    if (seam.id == seam_name::next_round)
+      seam.spec.H_sparse = {0, -1, 1, -1, 2, -1, 3, -1};
+
+  expect_error(
+      [&] { validate(spec, parallel_graph(layered(1, 1, 1))); },
+      "validate_commitment: A[1] (position", "is parallel to",
+      "which is in another zone");
+}
+
 // Boundary-column twins of buffer columns are accepted. Without a leading
 // buffer, a commit column's boundary or truncated twin is rejected.
 TEST(CommitmentParallel, AcceptsBoundaryTwinsOfBufferColumns) {
@@ -2153,6 +2571,27 @@ TEST(CommitmentParallel, MostLikelyResolvesAnObservableConflict) {
                "different observable effect",
                "conflicting_parallel: most_likely");
   expect_sound(rep5_spec(), with_most_likely(g));
+}
+
+TEST(CommitmentParallel, RejectsRowsOutsideTheWindow) {
+  auto request = layered(2, 2, 3).a;
+  request.buffers = {{-2, 0}};
+  request.sends.clear();
+  request.columns.conflicting_parallel = parallel_resolution::most_likely;
+  const auto tmpl = std::make_shared<const experiment_template>(
+      duplicate_columns_spec());
+  const auto w = window_from_dem_chunks(tmpl, request, 1, 14);
+  std::vector<parallel_columns> conflicts;
+  for (const auto &conflict : w.parallel_conflicts)
+    conflicts.push_back(
+        {w.fault_column_sources[conflict.commit_column].front(),
+         w.fault_column_sources[conflict.other_column].front(),
+         conflict.conflict});
+  EXPECT_EQ(conflicts,
+            (std::vector<parallel_columns>{{28, 29,
+                                            parallel_conflict::outside_rows},
+                                           {29, 28,
+                                            parallel_conflict::outside_rows}}));
 }
 
 // ---------------------------------------------------------------------------
@@ -2730,6 +3169,28 @@ TEST(DecodingWindow, AWindowWithoutADecoderCommitsNothing) {
   EXPECT_NE(make_window_decoder(w, "single_error_lut"), nullptr);
 }
 
+TEST(DecodingWindow, WorkspaceMatchesWindowShape) {
+  const auto tmpl =
+      std::make_shared<const experiment_template>(arbitrary_memory_spec(5));
+  const auto w = window_from_dem_chunks(tmpl, layered(2, 2, 3).a, 1, 20);
+  const auto ws = make_window_workspace(w);
+  const auto rows = w.model.h.num_rows();
+  const auto columns = w.model.o.num_cols();
+
+  EXPECT_EQ(ws.syndrome, std::vector<float_t>(rows, 0));
+  EXPECT_EQ(ws.explained, std::vector<std::uint8_t>(rows, 0));
+  EXPECT_EQ(ws.delta, std::vector<std::uint8_t>(rows, 0));
+  EXPECT_EQ(ws.solution.estimate, std::vector<std::uint8_t>(columns, 0));
+  EXPECT_EQ(ws.solution.outputs.committed,
+            std::vector<std::uint8_t>(columns, 0));
+  EXPECT_EQ(ws.solution.outputs.frame,
+            std::vector<std::uint8_t>(w.model.o.num_rows(), 0));
+  ASSERT_EQ(ws.solution.outputs.sends.size(), w.sends.size());
+  for (std::size_t i = 0; i < w.sends.size(); ++i)
+    EXPECT_EQ(ws.solution.outputs.sends[i],
+              std::vector<std::uint8_t>(w.sends[i].rows.size(), 0));
+}
+
 // A decoder whose params make it misreport what a window decoder must be:
 // observables instead of fault columns, or one detector or column more than
 // the window has.
@@ -3172,6 +3633,51 @@ dem_chunks_spec fixed_length_spec() {
   return spec;
 }
 
+TEST(IngestCore, RejectsInvalidConstructionAndNullData) {
+  const auto spec = arbitrary_memory_spec(5, true);
+  const auto context = std::make_shared<const experiment_template>(spec);
+  const auto layers = layered(3, 3, 9);
+  const std::vector<window_request> requests{layers.a, layers.b};
+
+  expect_throw<std::invalid_argument>(
+      [&] { ingest_core(nullptr, layers_of(requests)); }, "ingest: no template");
+  expect_throw<std::invalid_argument>(
+      [&] { ingest_core(context, std::vector<ingest_layer>{}); },
+      "ingest: no layer");
+  expect_throw<std::invalid_argument>(
+      [&] { ingest_core(context, std::vector<ingest_layer>{{layers.a, 0}}); },
+      "view pool is empty");
+
+  auto no_measurements = spec;
+  for (auto &phase : no_measurements.phases)
+    phase.spec.num_measurements = 0;
+  const auto no_measurements_context =
+      std::make_shared<const experiment_template>(no_measurements);
+  expect_throw<std::invalid_argument>(
+      [&] { ingest_core(no_measurements_context, layers_of(requests)); },
+      "a round holds no measurements");
+
+  auto out_of_bounds = spec;
+  phase_of(out_of_bounds, phase_name::dem_bulk).D_sparse[0] = 8;
+  const auto out_of_bounds_context =
+      std::make_shared<const experiment_template>(out_of_bounds);
+  expect_throw<std::invalid_argument>(
+      [&] { ingest_core(out_of_bounds_context, layers_of(requests)); },
+      "D_sparse reads measurement 8");
+
+  auto wrong_rows = spec;
+  phase_of(wrong_rows, phase_name::dem_bulk).D_sparse = {0, -1};
+  const auto wrong_rows_context =
+      std::make_shared<const experiment_template>(wrong_rows);
+  expect_throw<std::invalid_argument>(
+      [&] { ingest_core(wrong_rows_context, layers_of(requests)); },
+      "D_sparse has 1 rows");
+
+  ingest_core core(context, layers_of(requests));
+  expect_throw<std::invalid_argument>(
+      [&] { core.enqueue(nullptr, 1, false); }, "has no data");
+} // end - TEST(IngestCore, RejectsInvalidConstructionAndNullData)
+
 // A template that does not repeat has one shot length: its shots stream as
 // any other's, and a record that runs past its last round is rejected,
 // FINAL or not, however much it holds.
@@ -3211,6 +3717,46 @@ TEST(IngestCore, StreamsAShotOfFixedLength) {
                                   "ingest: round 0's detectors are not in "
                                   "the ring");
 } // end - TEST(IngestCore, StreamsAShotOfFixedLength)
+
+TEST(IngestCore, PollsPastIndexesWithoutWindows) {
+  const auto spec = fixed_length_spec();
+  const auto context = std::make_shared<const experiment_template>(spec);
+  const auto base = layered(2, 1, 3).a;
+  auto later = base;
+  later.offset += 5 * base.period;
+  const std::vector<window_request> requests{base, later};
+  std::mt19937 rng(19);
+  const shot s(spec, 3, rng);
+  ingest_core core(context, layers_of(requests));
+
+  ASSERT_EQ(window_instances(base, s.R).begin, 0);
+  ASSERT_EQ(window_instances(base, s.R).end, 1);
+  ASSERT_EQ(window_instances(later, s.R).begin, -5);
+  ASSERT_EQ(window_instances(later, s.R).end, -4);
+  ASSERT_EQ(core.enqueue(s.measurements.data(), s.measurements.size(), true),
+            ingest_status::accepted);
+
+  const auto *publication = core.poll();
+  ASSERT_NE(publication, nullptr);
+  ASSERT_EQ(publication->k, -5);
+  ASSERT_EQ(publication->views.size(), requests.size());
+  EXPECT_EQ(publication->views[0], nullptr);
+  ASSERT_NE(publication->views[1], nullptr);
+  expect_view(core, s, requests, *publication->views[1]);
+  core.release(*publication->views[1]);
+
+  publication = core.poll();
+  ASSERT_NE(publication, nullptr);
+  EXPECT_EQ(publication->k, 0);
+  ASSERT_EQ(publication->views.size(), requests.size());
+  ASSERT_NE(publication->views[0], nullptr);
+  EXPECT_EQ(publication->views[1], nullptr);
+  expect_view(core, s, requests, *publication->views[0]);
+  core.release(*publication->views[0]);
+
+  EXPECT_EQ(core.poll(), nullptr);
+  EXPECT_TRUE(core.done());
+} // end - TEST(IngestCore, PollsPastIndexesWithoutWindows)
 
 // The readout round may arrive before FINAL, in part or whole: a record
 // longer than the rounds before it, then a FINAL record with the rest, or
@@ -3252,6 +3798,34 @@ TEST(IngestCore, TakesAReadoutRoundThatArrivesBeforeFinal) {
   const shot even(arbitrary_memory_spec(5, true), 15, rng);
   ASSERT_NO_FATAL_FAILURE(streams(even, {48, 12, 0}));
 } // end - TEST(IngestCore, TakesAReadoutRoundThatArrivesBeforeFinal)
+
+TEST(IngestCore, ReassemblesWideReadoutAfterPrecutBulk) {
+  auto spec = arbitrary_memory_spec(5, true);
+  phase_of(spec, phase_name::dem_final).num_measurements = 100;
+  const auto layers = layered(3, 3, 9);
+  const std::vector<window_request> requests{layers.a, layers.b};
+  std::mt19937 rng(31);
+  const shot s(spec, 15, rng);
+  ingest_core core(s.context, layers_of(requests));
+
+  ASSERT_EQ(s.measurements.size(), 156u);
+  ASSERT_LE(s.measurements.size(), core.record_limit());
+  ASSERT_EQ(core.enqueue(s.measurements.data(), s.measurements.size(), false),
+            ingest_status::accepted);
+  const auto drain = [&] {
+    while (const auto *publication = core.poll())
+      for (const auto *view : publication->views)
+        if (view) {
+          expect_view(core, s, requests, *view);
+          core.release(*view);
+        }
+  };
+  drain();
+
+  ASSERT_EQ(core.enqueue(nullptr, 0, true), ingest_status::accepted);
+  drain();
+  EXPECT_TRUE(core.done());
+} // end - TEST(IngestCore, ReassemblesWideReadoutAfterPrecutBulk)
 
 // A record no longer than the limit is always taken once nothing is held:
 // rounds a record can complete before FINAL are bounded by the rounds cut
@@ -3391,6 +3965,60 @@ TEST(IngestCore, HoldsEveryRoundAViewNeeds) {
                                   "ingest: round 0's detectors are not in "
                                   "the ring");
 } // end - TEST(IngestCore, HoldsEveryRoundAViewNeeds)
+
+TEST(IngestCore, FinalRecordDefersForHeldRound) {
+  const auto spec = arbitrary_memory_spec(5, true);
+  const auto layers = layered(3, 3, 9);
+  const std::vector<window_request> requests{layers.a, layers.b};
+  std::mt19937 rng(37);
+  ingest_core core(std::make_shared<const experiment_template>(spec),
+                   layers_of(requests));
+  const auto rounds = core.ring_rounds() + 1;
+  const shot s(spec, rounds, rng);
+  const auto readout_start = s.context->measurement_offset(rounds - 1, rounds);
+  const auto readout_size = s.measurements.size() - readout_start;
+  ASSERT_EQ(readout_size, 4u);
+
+  const window_view *held = nullptr;
+  std::set<std::pair<std::size_t, std::int64_t>> published;
+  const auto drain = [&] {
+    while (const auto *publication = core.poll())
+      for (const auto *view : publication->views)
+        if (view) {
+          expect_view(core, s, requests, *view);
+          EXPECT_TRUE(published.insert({view->layer, view->k}).second);
+          if (!held && view->rounds.begin == 0)
+            held = view;
+          else
+            core.release(*view);
+        }
+  };
+
+  std::size_t at = 0;
+  while (at < readout_start) {
+    const auto len = std::min(core.record_limit(), readout_start - at);
+    ASSERT_EQ(core.enqueue(s.measurements.data() + at, len, false),
+              ingest_status::accepted);
+    at += len;
+    drain();
+  }
+  ASSERT_NE(held, nullptr);
+  const auto *readout = s.measurements.data() + readout_start;
+  ASSERT_EQ(core.enqueue(readout, readout_size, true), ingest_status::deferred);
+  core.release(*held);
+  held = nullptr;
+  ASSERT_EQ(core.enqueue(readout, readout_size, true), ingest_status::accepted);
+  drain();
+  EXPECT_TRUE(core.done());
+
+  std::set<std::pair<std::size_t, std::int64_t>> expected;
+  for (std::size_t layer = 0; layer < requests.size(); ++layer) {
+    const auto instances = window_instances(requests[layer], rounds);
+    for (auto k = instances.begin; k < instances.end; ++k)
+      expected.insert({layer, k});
+  }
+  EXPECT_EQ(published, expected);
+} // end - TEST(IngestCore, FinalRecordDefersForHeldRound)
 
 // A view's rows are read through the view, round by round, as detectors()
 // reads them; a round outside the view is not read through it, even while
@@ -3905,6 +4533,16 @@ layered_requests shifted(layered_requests requests, std::int64_t by) {
   return requests;
 }
 
+TEST(DecodeWindowCore, RejectsZeroSlots) {
+  data_artifact_store store;
+  expect_error(
+      [&] {
+        decode_window_core core(store, nullptr, {}, "", {}, 0);
+        (void)core;
+      },
+      "decode_window: no slot to fire into");
+}
+
 // Ingest and the decode_window cores, run serially on raw measurements with
 // windows from the store, decode every single fault as the reference does,
 // window by window, for every layout and shot length up to 24, and with
@@ -4047,6 +4685,63 @@ TEST(DecodeWindowCore, AMissingResidualIsRejected) {
             std::vector<std::uint8_t>(residual.values.begin(),
                                       residual.values.end()));
 } // end - TEST(DecodeWindowCore, AMissingResidualIsRejected)
+
+TEST(DecodeWindowCore, RejectsMalformedAndIncompleteResiduals) {
+  const auto spec = arbitrary_memory_spec(5);
+  const auto g = parallel_graph(layered(2, 1, 3));
+  constexpr std::size_t R = 30;
+  std::mt19937 rng(13);
+  data_artifact_store store;
+  const auto context = store.add_template(spec);
+  for (const auto &layer : g.layers)
+    store.add_windows(context, layer.request);
+  decode_window_core a(store, context, g.layers[0].request, "single_error_lut",
+                       {}, 2);
+  decode_window_core b(store, context, g.layers[1].request, "single_error_lut",
+                       {}, 2);
+  ingest_core ingest(context,
+                     {{g.layers[0].request, 4}, {g.layers[1].request, 4}});
+  std::vector<std::uint8_t> m(context->measurement_offset(R, R));
+  for (auto &x : m)
+    x = static_cast<std::uint8_t>(rng() & 1);
+  const ingest_publication *p = nullptr;
+  for (std::size_t at = 0; !p || !p->views[1]; at += ingest.record_limit()) {
+    ASSERT_LT(at + ingest.record_limit(), m.size());
+    ASSERT_EQ(ingest.enqueue(m.data() + at, ingest.record_limit(), false),
+              ingest_status::accepted);
+    while ((p = ingest.poll()) && !p->views[1])
+      ;
+  }
+  const auto &fired = a.fire(0, rows_of(*p->views[0]), {});
+  const auto &residual = fired.sends[a.send_index("backward")];
+  ASSERT_NE(residual.send, nullptr);
+  ASSERT_GT(residual.values.size(), 1u);
+  ASSERT_EQ(residual.values.size(), residual.send->rows.size());
+
+  const window_send_value malformed{
+      residual.values.first(residual.values.size() - 1), residual.send,
+      residual.first_row};
+  const window_send_value *malformed_receives[] = {nullptr, &malformed};
+  expect_error(
+      [&] { b.fire(0, rows_of(*p->views[1]), malformed_receives); },
+      "send '" + residual.send->id + "'", "window " + std::to_string(p->k),
+      std::to_string(malformed.values.size()) + " values for " +
+          std::to_string(residual.send->rows.size()) + " rows");
+  EXPECT_FALSE(b.held(0).fired);
+
+  auto truncated_send = *residual.send;
+  truncated_send.rows.pop_back();
+  const window_send_value incomplete{
+      residual.values.first(residual.values.size() - 1), &truncated_send,
+      residual.first_row};
+  const window_send_value *incomplete_receives[] = {nullptr, &incomplete};
+  expect_error(
+      [&] { b.fire(0, rows_of(*p->views[1]), incomplete_receives); },
+      "window " + std::to_string(p->k) + " imports " +
+          std::to_string(residual.values.size()) + " rows",
+      "imported row " + std::to_string(residual.values.size() - 1));
+  EXPECT_FALSE(b.held(0).fired);
+} // end - TEST(DecodeWindowCore, RejectsMalformedAndIncompleteResiduals)
 
 // single_error_lut whose decode() throws while fail_next is set, so a test
 // can fail a fire after it has started rewriting its slot.
@@ -4770,6 +5465,110 @@ TEST(DataArtifactStore, EveryFieldIsContent) {
   EXPECT_EQ(canonical_bytes(spec), canonical_bytes(dem_chunks_spec(spec)));
 } // end - TEST(DataArtifactStore, EveryFieldIsContent)
 
+TEST(DataArtifactStore, ParallelResolutionChangesWindowIdentity) {
+  data_artifact_store store;
+  const auto tmpl = store.add_template(arbitrary_memory_spec(5));
+  const auto request = layered(2, 2, 3).a;
+  auto most_likely_request = request;
+  most_likely_request.columns.conflicting_parallel =
+      parallel_resolution::most_likely;
+
+  ASSERT_NO_THROW(store.add_windows(tmpl, request));
+  ASSERT_NO_THROW(store.add_windows(tmpl, most_likely_request));
+
+  const auto reject_key = window_variant(*tmpl, request, 1, 14);
+  const auto most_likely_key =
+      window_variant(*tmpl, most_likely_request, 1, 14);
+  ASSERT_EQ(reject_key, most_likely_key);
+
+  const auto reject_bytes = canonical_bytes(request);
+  const auto most_likely_bytes = canonical_bytes(most_likely_request);
+  EXPECT_NE(reject_bytes.find(
+                "conflicting_parallel=" +
+                std::to_string(static_cast<int>(
+                    parallel_resolution::reject))),
+            std::string::npos);
+  EXPECT_NE(most_likely_bytes.find(
+                "conflicting_parallel=" +
+                std::to_string(static_cast<int>(
+                    parallel_resolution::most_likely))),
+            std::string::npos);
+  EXPECT_NE(store.window_sha256(*tmpl, request, reject_key),
+            store.window_sha256(*tmpl, most_likely_request, most_likely_key));
+}
+
+TEST(DataArtifactStore, WindowBytesEncodeNegativeShiftedVariant) {
+  data_artifact_store store;
+  const auto tmpl = store.add_template(arbitrary_memory_spec(5));
+  auto request = layered(2, 2, 3).a;
+  request.offset += request.period;
+  store.add_windows(tmpl, request);
+
+  std::optional<variant_key> selected_key;
+  for (auto R = tmpl->min_rounds();
+       R < variant_probe_rounds(*tmpl, request) + 2 * request.period; ++R) {
+    const auto instances = window_instances(request, R);
+    for (auto k = instances.begin; k < instances.end; ++k) {
+      const auto key = window_variant(*tmpl, request, k, R);
+      if (key.position == -1 && key.terminal) {
+        selected_key = key;
+        break;
+      }
+    }
+    if (selected_key)
+      break;
+  }
+  ASSERT_TRUE(selected_key);
+  ASSERT_EQ(selected_key->position, -1);
+  ASSERT_TRUE(selected_key->terminal);
+  const auto window = store.find_window(*tmpl, request, *selected_key);
+  ASSERT_NE(window, nullptr);
+
+  std::string expected_bytes = "window\n";
+  expected_bytes += "template=" + store.template_sha256(*tmpl) + '\n';
+  expected_bytes += canonical_bytes(request);
+  expected_bytes += "position=" + std::to_string(*selected_key->position) +
+                    '\n';
+  expected_bytes += "terminal=" + std::to_string(*selected_key->terminal) +
+                    '\n';
+  const auto expected_sha256 = sha256_hex(expected_bytes);
+  EXPECT_EQ(store.window_sha256(*tmpl, request, *selected_key),
+            expected_sha256);
+
+  const auto &records = store.records();
+  const auto window_record =
+      std::find_if(records.begin(), records.end(), [&](const auto &record) {
+        return record.kind == "window" && record.sha256 == expected_sha256;
+      });
+  ASSERT_NE(window_record, records.end());
+  EXPECT_EQ(window_record->bytes, expected_bytes.size());
+  EXPECT_EQ(window_record->sha256, expected_sha256);
+}
+
+TEST(DataArtifactStore, CanonicalIntegerListsPreserveOrderAndEmptyEncoding) {
+  auto spec = arbitrary_memory_spec(5, true);
+  auto &phase = spec.phases.front();
+  phase.spec.H_sparse = {7, -2, 0};
+  phase.spec.O_sparse.clear();
+  const auto bytes = canonical_bytes(spec);
+
+  const auto phase_marker = "phase=" + std::to_string(phase.id.value) + '\n';
+  const auto phase_begin = bytes.find(phase_marker);
+  ASSERT_NE(phase_begin, std::string::npos);
+  const auto h_sparse = bytes.find("H_sparse=7,-2,0,\n", phase_begin);
+  ASSERT_NE(h_sparse, std::string::npos);
+  EXPECT_NE(bytes.find("O_sparse=\n", h_sparse), std::string::npos);
+}
+
+TEST(DataArtifactStore, CanonicalBytesLengthPrefixObservableNames) {
+  dem_chunks_spec spec;
+  spec.observable_names = {"A\nseam=1,2", ""};
+
+  const auto bytes = canonical_bytes(spec);
+  EXPECT_NE(bytes.find("observable_name=10:A\nseam=1,2\nobservable_name=0:\n"),
+            std::string::npos);
+}
+
 // Equal content is one entry and one handle; its record gives the kind and
 // the size and sha256 of the canonical bytes. Lookups return what was added.
 TEST(DataArtifactStore, EqualTemplatesShareOneEntry) {
@@ -4789,6 +5588,18 @@ TEST(DataArtifactStore, EqualTemplatesShareOneEntry) {
   EXPECT_NE(store.records()[1].sha256, store.records()[0].sha256);
   expect_logic_error(
       [&] { store.find_template(single_round_spec()); },
+      "data_artifact_store::find_template: no template with this content was "
+      "added");
+}
+
+TEST(DataArtifactStore, RejectsInvalidTemplateWithoutRecordingIt) {
+  const dem_chunks_spec spec;
+  data_artifact_store store;
+  expect_error([&] { store.add_template(spec); },
+               "dem_chunks_spec: no phases or connections");
+  EXPECT_TRUE(store.records().empty());
+  expect_logic_error(
+      [&] { store.find_template(spec); },
       "data_artifact_store::find_template: no template with this content was "
       "added");
 }
@@ -4850,6 +5661,41 @@ TEST(DataArtifactStore, VariantsBuildOnceAndLookupsNeverBuild) {
       [&] { store.find_window(std::string(64, '0'), request, *keys.begin()); },
       "was not built at configuration time");
 } // end - TEST(DataArtifactStore, VariantsBuildOnceAndLookupsNeverBuild)
+
+TEST(DataArtifactStore, RebuildsWindowsAfterSharedHandlesExpire) {
+  const auto spec = arbitrary_memory_spec(5);
+  const auto request = layered(2, 2, 3).a;
+  std::weak_ptr<const decoding_window> expired_window;
+  {
+    data_artifact_store store;
+    const auto tmpl = store.add_template(spec);
+    store.add_windows(tmpl, request);
+    const auto windows = store.find_windows(*tmpl, request);
+    ASSERT_FALSE(windows.empty());
+    expired_window = windows.front().second;
+  }
+  EXPECT_TRUE(expired_window.expired());
+
+  {
+    data_artifact_store store;
+    const auto tmpl = store.add_template(spec);
+    store.add_windows(tmpl, request);
+    std::size_t checked = 0;
+    for (auto R = tmpl->min_rounds();
+         R < variant_probe_rounds(*tmpl, request) + 2 * request.period; ++R) {
+      const auto instances = window_instances(request, R);
+      for (auto k = instances.begin; k < instances.end; ++k) {
+        const auto key = window_variant(*tmpl, request, k, R);
+        const auto w = store.find_window(*tmpl, request, key);
+        ASSERT_NE(w, nullptr);
+        EXPECT_NO_THROW(check_same_window_up_to_shift(
+            *w, window_from_dem_chunks(tmpl, request, k, R)));
+        ++checked;
+      }
+    }
+    EXPECT_GT(checked, 0u);
+  }
+} // end - TEST(DataArtifactStore, RebuildsWindowsAfterSharedHandlesExpire)
 
 // A template is its content: an equal one built elsewhere finds the store's
 // windows, a zero's sign is not content, and a store that holds no template
@@ -4957,6 +5803,21 @@ TEST(WindowPayloads, AreEdgeValuesRefilledInPlace) {
   EXPECT_EQ(held_rows.get<window_rows>().detectors, rows.detectors);
   EXPECT_EQ(held_send.get<window_send_payload>().values, payload.values);
 } // end - TEST(WindowPayloads, AreEdgeValuesRefilledInPlace)
+
+TEST(WindowPayloads, SelfAssignmentPreservesPayload) {
+  edge_value value(logical_outcome{{1, 0}, true});
+  auto &same = value;
+
+  value = same;
+  EXPECT_EQ(value.get<logical_outcome>().bits,
+            (std::vector<std::uint8_t>{1, 0}));
+  EXPECT_TRUE(value.get<logical_outcome>().converged);
+
+  value = std::move(same);
+  EXPECT_EQ(value.get<logical_outcome>().bits,
+            (std::vector<std::uint8_t>{1, 0}));
+  EXPECT_TRUE(value.get<logical_outcome>().converged);
+}
 
 // ---------------------------------------------------------------------------
 // The ingest node
@@ -5153,6 +6014,7 @@ TEST(IngestNode, DeclaresItsPorts) {
   EXPECT_TRUE(reading.supports_raw_streaming_input(0));
   EXPECT_EQ(reading.streaming(),
             static_cast<streaming_task_graph_node *>(&reading));
+  EXPECT_TRUE(reading.exact_interval_coverage());
   EXPECT_FALSE(reading.supports_fire_pool());
   EXPECT_EQ(reading.raw_chunk_limit(), core.record_limit());
   EXPECT_EQ(reading.num_msyn_per_decode(), core.record_limit());
@@ -5167,6 +6029,7 @@ TEST(IngestNode, DeclaresItsPorts) {
   ASSERT_TRUE(schedule.has_value());
   EXPECT_TRUE(*schedule == (window_spec{period, period, 0, 0}));
   EXPECT_EQ(reading.num_observables(), 0u);
+  EXPECT_EQ(reading.corrections(), nullptr);
   expect_throw<std::logic_error>(
       [&] { reading.execute_indexed({}, outputs); },
       "ingest: the node streams; it has no one-shot path");
@@ -5970,6 +6833,21 @@ TEST(DecodeWindowNode, TakesWindowsFromAnyProducer) {
   } // end - for(c)
 } // end - TEST(DecodeWindowNode, TakesWindowsFromAnyProducer)
 
+TEST(DecodeWindowNode, InputGuaranteeRejectsWindowAndUnconfiguredReceiveSlots) {
+  const auto spec = arbitrary_memory_spec(5);
+  const auto g = parallel_graph(layered(2, 1, 3));
+  data_artifact_store store;
+  const auto context = store.add_template(spec);
+  for (const auto &layer : g.layers)
+    store.add_windows(context, layer.request);
+  decode_window_node node(store, context, g.layers[1].request,
+                          "single_error_lut", {}, 1,
+                          verify_residual_mode::none);
+
+  EXPECT_FALSE(node.input_guaranteed(0, 0));
+  EXPECT_FALSE(node.input_guaranteed(1, 0));
+} // end - TEST(DecodeWindowNode, InputGuaranteeRejectsWindowAndUnconfiguredReceiveSlots)
+
 // A decode_window node takes a window on `input` and a send on each
 // `receive_<i>`, of which only the window is required, and offers its
 // frame update on `output` and each send of its layer on a port named by
@@ -6051,7 +6929,9 @@ TEST(DecodeWindowNode, DeclaresItsPorts) {
   EXPECT_TRUE(b.supports_streaming_input(2));
   EXPECT_FALSE(b.supports_streaming_input(3));
   EXPECT_TRUE(b.exact_interval_coverage());
+  EXPECT_FALSE(static_cast<const task_graph_node &>(b).has_one_shot_path());
   EXPECT_EQ(b.num_observables(), 1u);
+  EXPECT_EQ(b.num_msyn_per_decode(), 0u);
   EXPECT_EQ(b.streaming(), static_cast<streaming_task_graph_node *>(&b));
   EXPECT_EQ(b.indexed_join(), static_cast<indexed_join_node *>(&b));
   EXPECT_EQ(b.streaming_output(0), nullptr);
@@ -6163,7 +7043,10 @@ TEST(DecodeWindowNode, PublishesUntilTheNextFireOrReset) {
       }
   } // end - for(c)
   ASSERT_TRUE(window.has_value());
+  EXPECT_FALSE(a.publication_closure().has_value());
   ASSERT_TRUE(a.fire(7, {&*window}));
+  EXPECT_EQ(a.publication_closure(),
+            std::optional<task_graph_closure>(task_graph_closure::not_checked));
   EXPECT_EQ(a.streaming_output(0)->get<logical_outcome>().bits, frame);
   EXPECT_EQ(a.published_index(0), std::optional<std::int64_t>(7));
   EXPECT_TRUE(a.streaming_coverage().has_value());
@@ -6182,15 +7065,21 @@ TEST(DecodeWindowNode, PublishesUntilTheNextFireOrReset) {
   EXPECT_EQ(a.streaming_output(0)->get<logical_outcome>().bits, frame);
   a.reset_streaming_state();
   EXPECT_EQ(a.streaming_output(0), nullptr);
+  EXPECT_FALSE(a.publication_closure().has_value());
   EXPECT_FALSE(a.streaming_coverage().has_value());
   EXPECT_FALSE(a.published_index(0).has_value());
 
   blind_decoder::converges = false;
+  EXPECT_FALSE(doubtful.publication_converged().has_value());
   ASSERT_TRUE(doubtful.fire(0, {&*window}));
   blind_decoder::converges = true;
+  EXPECT_EQ(doubtful.publication_converged(), std::optional<bool>(false));
   EXPECT_FALSE(doubtful.streaming_output(0)->get<logical_outcome>().converged);
   ASSERT_TRUE(doubtful.fire(0, {&*window}));
+  EXPECT_EQ(doubtful.publication_converged(), std::optional<bool>(true));
   EXPECT_TRUE(doubtful.streaming_output(0)->get<logical_outcome>().converged);
+  doubtful.reset_streaming_state();
+  EXPECT_FALSE(doubtful.publication_converged().has_value());
 } // end - TEST(DecodeWindowNode, PublishesUntilTheNextFireOrReset)
 
 // A fire allocates nothing beyond what its decoder's decode() does, from

@@ -16,11 +16,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <ctime>
 #include <gtest/gtest.h>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 
@@ -343,6 +345,20 @@ TEST(AnalyzerEdgeCases, BitStringEncodingIsExactAndKeepsBitOrder) {
   }
 }
 
+TEST(AnalyzerEdgeCases, NonCanonicalBitBytesAreRenderedAsBooleanValues) {
+  run_result r;
+  record rec;
+  rec.syndrome_count = 3;
+  rec.correction_count = 3;
+  r.syndrome_log = {0, 2, 255};
+  r.correction_log = {255, 0, 2};
+  r.records.push_back(rec);
+
+  const auto cols = only_row(r);
+  EXPECT_EQ(cols[kColSyndromeBits], "011");
+  EXPECT_EQ(cols[kColCorrectionBits], "101");
+}
+
 // -- maximally-degenerate result ---------------------------------------------
 
 TEST(AnalyzerEdgeCases, ADefaultResultWithWarningsProducesOneWellFormedRow) {
@@ -468,6 +484,31 @@ TEST(Capabilities, PlanAcceptsWhatItCannotProveWrong) {
   auto one_decoder = parse("0 reset\n", {0, 1}, 1000);
   std::unordered_map<std::uint64_t, session *> shared{{0, &a}, {1, &a}};
   EXPECT_NO_THROW(plan(one_decoder, shared, {}));
+}
+
+TEST(FrameSerialization, LiteralEnqueueBitsArePackedLsbFirstInPlannedFrame) {
+  FakeSession s;
+  auto sched = parse("0 enqueue source=0b101001011\n", {0}, 1000);
+  std::unordered_map<std::uint64_t, session *> router{{0, &s}};
+  auto planned = plan(sched, router, {});
+
+  ASSERT_EQ(planned->event_plans.size(), 1u);
+  ASSERT_EQ(planned->event_plans[0].size(), 1u);
+  const auto &round = planned->event_plans[0][0];
+  EXPECT_EQ(round.bits_count, 9u);
+  ASSERT_EQ(round.frame_len,
+            sizeof(cudaq::realtime::RPCHeader) +
+                sizeof(cudaq::qec::decoding::rpc::EnqueueRequestPayload) + 2u);
+
+  cudaq::qec::decoding_server::slot::EnqueueView view;
+  ASSERT_TRUE(cudaq::qec::decoding_server::slot::parse_enqueue(
+      planned->frame_arena.data() + round.frame_offset, round.frame_len, view));
+  EXPECT_EQ(view.header->arg_len,
+            sizeof(cudaq::qec::decoding::rpc::EnqueueRequestPayload) + 2u);
+  EXPECT_EQ(view.num_syndromes, 9u);
+  ASSERT_EQ(view.byte_count, 2u);
+  EXPECT_EQ(view.packed_bits[0], static_cast<std::uint8_t>(0xA5));
+  EXPECT_EQ(view.packed_bits[1], static_cast<std::uint8_t>(0x01));
 }
 
 TEST(Capabilities, AStreamedRoundTooBigForItsSessionFailsLoudlyAtRunTime) {
@@ -785,6 +826,64 @@ private:
   std::chrono::milliseconds delay_;
 };
 
+struct ThrowAfterOneSource : syndrome_source {
+  std::vector<std::uint8_t> next_round() override {
+    if (calls++ == 0)
+      return {1};
+    throw std::runtime_error("injected source failure");
+  }
+
+  bool is_streamed() const override { return true; }
+
+  std::size_t calls = 0;
+};
+
+struct WithheldReplySession : session {
+  void start(run_ctx &collector) override { collector_ = &collector; }
+
+  void send(const frame &, tag) override {}
+
+  void event_done(std::uint32_t event, std::uint32_t issued,
+                  std::int32_t term, bool has_term) override {
+    handle_event_done(*collector_, event, issued, term, has_term);
+  }
+
+  void stop(std::chrono::nanoseconds) override {}
+
+  run_ctx *collector_ = nullptr;
+};
+
+struct ImmediateBadRequestSession : session {
+  void start(run_ctx &collector) override { collector_ = &collector; }
+
+  void send(const frame &, tag request) override {
+    handle_reply(*collector_, request, RpcStatus::BAD_REQUEST, nullptr, 0,
+                 now_ns());
+  }
+
+  void event_done(std::uint32_t event, std::uint32_t issued,
+                  std::int32_t term, bool has_term) override {
+    handle_event_done(*collector_, event, issued, term, has_term);
+  }
+
+  void stop(std::chrono::nanoseconds) override {}
+
+  run_ctx *collector_ = nullptr;
+};
+
+struct DelayedBadRequestSession : blocking_session {
+  RpcStatus send_sync(const frame &, std::span<std::uint8_t>,
+                      std::size_t &reply_len) override {
+    reply_len = 0;
+    return RpcStatus::BAD_REQUEST;
+  }
+
+protected:
+  void before_reply() override {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+};
+
 /// A source deep enough that no test here runs it dry.
 std::unique_ptr<static_source> deep_source(std::size_t rounds = 4000) {
   return std::make_unique<static_source>(std::vector<std::vector<std::uint8_t>>(
@@ -958,6 +1057,179 @@ TEST(Signals, AStreamCanWaitOnAResetsSignal) {
   const auto &r = result.records[1];
   EXPECT_EQ(r.status, static_cast<std::int32_t>(stream_terminate::OK));
   EXPECT_GT(r.rounds_streamed, 1u); // it kept sending while the reset flew
+}
+
+TEST(StreamFailure, AStreamedSourceExceptionTerminatesAfterOneRound) {
+  FakeSession s;
+  ThrowAfterOneSource src;
+  auto sched = parse("0 stream source=0 rounds=3\n", {0}, 1000);
+  std::unordered_map<std::uint64_t, session *> router{{0, &s}};
+  run_params params;
+  params.lead_in_ns = 0;
+  auto result = run(plan(sched, router, {{0, &src}}, params));
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(stream_terminate::ERROR));
+  EXPECT_EQ(result.records[0].rounds_streamed, 1u);
+  EXPECT_TRUE(std::any_of(result.warnings.begin(), result.warnings.end(),
+                          [](const std::string &warning) {
+                            return warning.find(
+                                       "threw while drawing from its source") !=
+                                   std::string::npos;
+                          }));
+}
+
+TEST(StreamFailure, ASourceExceptionBeforeFirstRoundSettlesWithoutRequests) {
+  struct ThrowOnFirstRoundSource : syndrome_source {
+    std::vector<std::uint8_t> next_round() override {
+      throw std::runtime_error("injected source failure");
+    }
+
+    bool is_streamed() const override { return true; }
+  } src;
+
+  FakeSession s;
+  auto sched = parse("0 stream source=0 rounds=3\n", {0}, 1000);
+  std::unordered_map<std::uint64_t, session *> router{{0, &s}};
+  run_params params;
+  params.lead_in_ns = 0;
+  auto result = run(plan(sched, router, {{0, &src}}, params));
+
+  ASSERT_EQ(result.records.size(), 1u);
+  EXPECT_EQ(result.records[0].status,
+            static_cast<std::int32_t>(stream_terminate::ERROR));
+  EXPECT_EQ(result.records[0].rounds_streamed, 0u);
+  EXPECT_EQ(result.records[0].request_id_count, 0u);
+  EXPECT_TRUE(result.request_id_log.empty());
+  EXPECT_TRUE(std::any_of(result.warnings.begin(), result.warnings.end(),
+                          [](const std::string &warning) {
+                            return warning.find(
+                                       "threw while drawing from its source") !=
+                                   std::string::npos;
+                          }));
+}
+
+TEST(StreamFailure, AHardErrorAbortsTheStreamAtItsNextIteration) {
+  WithheldReplySession signal_raiser;
+  ImmediateBadRequestSession bad_stream;
+  static_source src({{1}, {1}, {1}});
+  auto sched = parse("0 reset signal=ready\n"
+                     "0 stream session=1 source=0 rounds=3 until=ready\n",
+                     {0, 1}, 1000);
+  std::unordered_map<std::uint64_t, session *> router{
+      {0, &signal_raiser}, {1, &bad_stream}};
+  run_params params;
+  params.lead_in_ns = 0;
+  auto result = run(plan(sched, router, {{0, &src}}, params));
+
+  ASSERT_EQ(result.records.size(), 2u);
+  EXPECT_EQ(result.records[1].status,
+            static_cast<std::int32_t>(stream_terminate::ERROR));
+  EXPECT_EQ(result.records[1].rounds_streamed, 1u);
+}
+
+TEST(MultiDecoderAdversarial,
+     AHardErrorAbortsAnEventWaitingAfterTheSpinDeadline) {
+  WithheldReplySession signal_raiser;
+  DelayedBadRequestSession delayed_error;
+  auto sched = parse("0 reset signal=ready\n"
+                     "0 reset session=1\n"
+                     "1 reset after=ready\n",
+                     {0, 1}, 1'000'000);
+  std::unordered_map<std::uint64_t, session *> router{
+      {0, &signal_raiser}, {1, &delayed_error}};
+  run_params params;
+  params.lead_in_ns = 0;
+  auto result = run(plan(sched, router, {}, params));
+
+  ASSERT_EQ(result.records.size(), 3u);
+  EXPECT_FALSE(result.records[2].dispatched);
+  EXPECT_EQ(result.records[2].deadline_ns, 1'000'000u);
+  EXPECT_GT(result.records[1].return_ns,
+            result.records[2].deadline_ns + 2'000'000u);
+  EXPECT_TRUE(std::any_of(result.warnings.begin(), result.warnings.end(),
+                          [](const std::string &warning) {
+                            return warning.find("event 0") != std::string::npos &&
+                                   warning.find("never got a reply") !=
+                                       std::string::npos;
+                          }));
+}
+
+TEST(MultiDecoderAdversarial, ConcurrentCorrectionRepliesAppendSafely) {
+  constexpr std::size_t kBitsPerReply = 32768;
+  constexpr std::size_t kEventsPerDecoder = 16;
+  constexpr std::size_t kDecoderCount = 2;
+  std::barrier reply_barrier(kDecoderCount);
+
+  struct BarrierSession : blocking_session {
+    explicit BarrierSession(std::barrier<> &barrier) : barrier(barrier) {}
+
+    RpcStatus send_sync(const frame &, std::span<std::uint8_t> reply,
+                        std::size_t &reply_len) override {
+      std::fill(reply.begin(), reply.end(), 0xff);
+      reply_len = reply.size();
+      return RpcStatus::OK;
+    }
+
+  protected:
+    void before_reply() override {
+      if (!waited_for_first_reply) {
+        waited_for_first_reply = true;
+        barrier.arrive_and_wait();
+      }
+    }
+
+  private:
+    std::barrier<> &barrier;
+    bool waited_for_first_reply = false;
+  } decoder_0(reply_barrier), decoder_1(reply_barrier);
+
+  std::ostringstream schedule_text;
+  for (std::size_t i = 0; i < kEventsPerDecoder; ++i)
+    schedule_text << "0 get_corrections session=0 return_size=" << kBitsPerReply
+                  << '\n';
+  for (std::size_t i = 0; i < kEventsPerDecoder; ++i)
+    schedule_text << "0 get_corrections session=1 return_size=" << kBitsPerReply
+                  << '\n';
+
+  auto sched = parse(schedule_text.str(), {0, 1}, 1000);
+  std::unordered_map<std::uint64_t, session *> router{
+      {0, &decoder_0}, {1, &decoder_1}};
+  run_params params;
+  params.lead_in_ns = 0;
+  auto result = run(plan(sched, router, {}, params));
+
+  constexpr std::size_t kExpectedRecords = kEventsPerDecoder * kDecoderCount;
+  constexpr std::size_t kExpectedBits = kExpectedRecords * kBitsPerReply;
+  ASSERT_EQ(result.records.size(), kExpectedRecords);
+  ASSERT_EQ(result.correction_log.size(), kExpectedBits);
+  EXPECT_TRUE(std::all_of(result.correction_log.begin(),
+                          result.correction_log.end(),
+                          [](std::uint8_t bit) { return bit == 1; }));
+
+  std::vector<std::pair<std::size_t, std::size_t>> slices;
+  slices.reserve(result.records.size());
+  for (const auto &rec : result.records) {
+    EXPECT_TRUE(rec.dispatched);
+    EXPECT_EQ(rec.status, static_cast<std::int32_t>(RpcStatus::OK));
+    EXPECT_TRUE(rec.read_completed);
+    EXPECT_EQ(rec.correction_count, kBitsPerReply);
+
+    const auto begin = static_cast<std::size_t>(rec.correction_offset);
+    const auto end = begin + rec.correction_count;
+    ASSERT_LE(end, result.correction_log.size());
+    slices.emplace_back(begin, end);
+  }
+
+  std::sort(slices.begin(), slices.end());
+  std::size_t covered_until = 0;
+  for (const auto &[begin, end] : slices) {
+    EXPECT_EQ(begin, covered_until)
+        << "record slices must be disjoint and gap-free";
+    covered_until = end;
+  }
+  EXPECT_EQ(covered_until, result.correction_log.size());
 }
 
 // ─── RequestIds ─────────────────────────────────────────────────────────────

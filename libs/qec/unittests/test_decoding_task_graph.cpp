@@ -7,6 +7,7 @@
 #include "../lib/decoding_task/decoding_task_data_artifacts.h"
 #include "../lib/decoding_task/decoding_task_decode_window_node.h"
 #include "../lib/decoding_task/decoding_task_edge_value.h"
+#include "../lib/decoding_task/decoding_task_graph_node.h"
 #include "../lib/decoding_task/decoding_task_graph_utils.h"
 #include "../lib/decoding_task/decoding_task_ingest_node.h"
 #include "../lib/decoding_task/decoding_task_logical_readout_node.h"
@@ -16,6 +17,8 @@
 #include "../lib/decoding_task/decoding_task_predecoder_node.h"
 #include "../lib/decoding_task/decoding_task_streaming_node.h"
 #include "../lib/decoding_task/decoding_task_window_node.h"
+#include "../lib/decoding_task/decoding_task_xor_node.h"
+#include "../lib/decoding_task/measurement_frame_lengths.h"
 #include "../lib/realtime/decode_target.h"
 #include "../lib/realtime/realtime_decoding.h"
 #include "cudaq/qec/code_matrices.h"
@@ -39,8 +42,10 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <functional>
 #include <gtest/gtest.h>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -69,6 +74,180 @@ namespace {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+TEST(DecodingTaskGraph, ReadMeasurementFrameLengths) {
+  struct scoped_file_cleanup {
+    std::filesystem::path path;
+    ~scoped_file_cleanup() {
+      std::error_code error;
+      std::filesystem::remove(path, error);
+    }
+  };
+
+  static std::atomic<std::uint64_t> next_file_id{0};
+  const auto file_path = std::filesystem::temp_directory_path() /
+                         ("cudaq-qec-measurement-frame-lengths-" +
+                          std::to_string(std::chrono::steady_clock::now()
+                                             .time_since_epoch()
+                                             .count()) +
+                          "-" + std::to_string(next_file_id.fetch_add(1)) +
+                          ".bin");
+  const scoped_file_cleanup cleanup{file_path};
+
+  const auto write_bytes = [&](const std::vector<unsigned char> &bytes) {
+    std::ofstream output(file_path, std::ios::binary | std::ios::trunc);
+    if (!output)
+      return false;
+    output.write(reinterpret_cast<const char *>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    return output.good();
+  };
+  const auto write_widths = [&](const std::vector<std::uint32_t> &widths) {
+    std::vector<unsigned char> bytes;
+    bytes.reserve(widths.size() * 4);
+    for (const auto width : widths) {
+      bytes.push_back(static_cast<unsigned char>(width));
+      bytes.push_back(static_cast<unsigned char>(width >> 8));
+      bytes.push_back(static_cast<unsigned char>(width >> 16));
+      bytes.push_back(static_cast<unsigned char>(width >> 24));
+    }
+    return write_bytes(bytes);
+  };
+
+  ASSERT_TRUE(write_widths({2, 3}));
+  EXPECT_EQ(detail::read_measurement_frame_lengths(file_path.string(), 5),
+            (std::vector<std::size_t>{2, 3}));
+  EXPECT_EQ(detail::read_measurement_frame_lengths(file_path.string()),
+            (std::vector<std::size_t>{2, 3}));
+
+  ASSERT_TRUE(write_bytes({0x01, 0x02, 0x03}));
+  EXPECT_THROW(detail::read_measurement_frame_lengths(file_path.string()),
+               std::invalid_argument);
+
+  ASSERT_TRUE(write_widths({0}));
+  EXPECT_THROW(detail::read_measurement_frame_lengths(file_path.string()),
+               std::invalid_argument);
+
+  ASSERT_TRUE(write_widths({3}));
+  EXPECT_THROW(detail::read_measurement_frame_lengths(file_path.string(), 2),
+               std::invalid_argument);
+
+  ASSERT_TRUE(write_bytes({}));
+  EXPECT_THROW(detail::read_measurement_frame_lengths(file_path.string()),
+               std::invalid_argument);
+
+  ASSERT_TRUE(write_widths({2}));
+  EXPECT_THROW(detail::read_measurement_frame_lengths(file_path.string(), 3),
+               std::invalid_argument);
+
+  EXPECT_THROW(detail::read_measurement_frame_lengths(
+                   (file_path.string() + ".missing")),
+               std::invalid_argument);
+}
+
+class base_default_capture_graph_node final
+    : public decoder_backed_task_graph_node {
+public:
+  void reset_decoder() override {}
+  std::optional<int> cuda_device_id() const override { return std::nullopt; }
+  decoder *inner_decoder() const override { return nullptr; }
+};
+
+TEST(DecodingTaskGraph, CaptureGraphBaseDefaultReturnsNull) {
+  base_default_capture_graph_node concrete_node;
+  decoder_backed_task_graph_node &node = concrete_node;
+  EXPECT_FALSE(node.supports_graph_dispatch());
+  EXPECT_EQ(node.capture_graph(17), nullptr);
+}
+
+class base_default_logical_completion_node final : public task_graph_node {
+public:
+  void execute_indexed(const std::vector<edge_value> &,
+                       std::vector<edge_value> &) const override {}
+  std::vector<std::string> inputs() const override { return {}; }
+  std::vector<std::string> outputs() const override { return {}; }
+};
+
+class base_default_output_type_node final : public task_graph_node {
+public:
+  void execute_indexed(const std::vector<edge_value> &,
+                       std::vector<edge_value> &) const override {}
+  std::vector<std::string> inputs() const override { return {}; }
+  std::vector<std::string> outputs() const override { return {}; }
+};
+
+TEST(DecodingTaskGraph, OutputTypeBaseDefaultNullopt) {
+  const base_default_output_type_node concrete_node;
+  const task_graph_node &node = concrete_node;
+  EXPECT_FALSE(node.output_type(0).has_value());
+  EXPECT_FALSE(node.output_type(7).has_value());
+}
+
+TEST(DecodingTaskGraph, LogicalCompletionRoundsBaseDefaultEmpty) {
+  const base_default_logical_completion_node concrete_node;
+  const task_graph_node &node = concrete_node;
+  EXPECT_EQ(node.logical_completion_rounds(),
+            (std::vector<std::optional<std::uint64_t>>{}));
+}
+
+TEST(DecodingTaskGraph, AcceptsInputTypeBaseDefaultRejects) {
+  const base_default_logical_completion_node concrete_node;
+  const task_graph_node &node = concrete_node;
+  EXPECT_FALSE(node.accepts_input_type(
+      0, edge_value_type("measurement_results")));
+  EXPECT_FALSE(
+      node.accepts_input_type(0, edge_value_type("detection_events")));
+}
+
+class base_default_interface_node final
+    : public task_graph_node,
+      public streaming_task_graph_node,
+      public decoder_backed_task_graph_node,
+      public indexed_join_node {
+public:
+  void execute_indexed(const std::vector<edge_value> &,
+                       std::vector<edge_value> &) const override {}
+  std::vector<std::string> inputs() const override { return {}; }
+  std::vector<std::string> outputs() const override { return {}; }
+
+  bool enqueue(const uint8_t *, std::size_t, round_type) override {
+    return false;
+  }
+  const uint8_t *corrections() const override { return nullptr; }
+  void clear_corrections() override {}
+  void reset_streaming_state() override {}
+  std::size_t num_msyn_per_decode() const override { return 0; }
+  std::size_t num_observables() const override { return 0; }
+
+  void reset_decoder() override {}
+  std::optional<int> cuda_device_id() const override { return std::nullopt; }
+  decoder *inner_decoder() const override { return nullptr; }
+
+  bool requires_input(std::size_t) const override { return false; }
+  bool fire(std::int64_t,
+            const std::vector<const edge_value *> &) override {
+    return false;
+  }
+};
+
+TEST(DecodingTaskGraph, InterfaceBaseDefaultsReturnUnsupportedValues) {
+  base_default_interface_node concrete_node;
+  const task_graph_node &task_node = concrete_node;
+  streaming_task_graph_node &streaming_node = concrete_node;
+  decoder_backed_task_graph_node &decoder_node = concrete_node;
+  const indexed_join_node &join_node = concrete_node;
+
+  EXPECT_EQ(decoder_node.capture_graph(17), nullptr);
+  EXPECT_EQ(streaming_node.streaming_output(0), nullptr);
+  const edge_value value{detection_events{{1.0f}}};
+  EXPECT_FALSE(streaming_node.enqueue_edge_value(value, 0));
+  EXPECT_TRUE(task_node.logical_completion_rounds().empty());
+  EXPECT_FALSE(task_node.accepts_input_type(
+      0, edge_value_type("detection_events")));
+  EXPECT_EQ(task_node.decoder_backed(), nullptr);
+  EXPECT_FALSE(join_node.input_guaranteed(0, 0));
+  EXPECT_FALSE(task_node.output_type(0).has_value());
+}
 
 // Matrices derived from one rep-3 chunk, shared by the tests below: they all
 // decode the same code and differ only in what they do with the graph.
@@ -234,6 +413,15 @@ TEST(ApplyDSparse, SingleRowXor) {
   EXPECT_EQ(dets.bits[1], 0.0f); // 0
 }
 
+TEST(ApplyDSparse, EmptyMeasurementRecordProducesZeroDetectors) {
+  measurement_results m;
+  const std::vector<std::vector<uint32_t>> d = {{}, {}};
+  const auto dets = apply_d_sparse(m, d);
+  ASSERT_EQ(dets.bits.size(), 2u);
+  EXPECT_EQ(dets.bits[0], 0.0f);
+  EXPECT_EQ(dets.bits[1], 0.0f);
+}
+
 TEST(ApplyDSparse, OutOfRangeThrows) {
   std::vector<std::vector<uint32_t>> d = {{5}};
   measurement_results m;
@@ -263,6 +451,15 @@ TEST(ApplyOSparse, NoFlip) {
   e.result = {0.0f};
   const auto lo = apply_o_sparse(e, o);
   EXPECT_EQ(lo.bits[0], 0u);
+}
+
+TEST(ApplyOSparse, EmptyMapPreservesConvergence) {
+  const std::vector<std::vector<uint32_t>> o;
+  error_pattern e;
+  e.converged = false;
+  const auto lo = apply_o_sparse(e, o);
+  EXPECT_TRUE(lo.bits.empty());
+  EXPECT_FALSE(lo.converged);
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +812,48 @@ TEST(DecodingTaskGraph, LogicalOutputJoinsAScheduledContributor) {
   }
   EXPECT_GT(ones, 0u);
 } // end - TEST(DecodingTaskGraph, LogicalOutputJoinsAScheduledContributor)
+
+TEST(DecodingTaskGraph, XorKindBuildsConfiguredThreeInputNode) {
+  std::vector<task_graph_node_config> nodes(4);
+  for (std::size_t input_index = 0; input_index < 3; ++input_index) {
+    nodes[input_index].id = "window_" + std::to_string(input_index);
+    nodes[input_index].kind = "single_window";
+    nodes[input_index].dem = rep5_spec(5);
+    nodes[input_index].decoder_type = "single_error_lut";
+  }
+  nodes[3].id = "combine";
+  nodes[3].kind = "xor";
+  nodes[3].node_params = {{"num_inputs", std::size_t{3}}};
+
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "window_0", "input"},
+       {"measurements", "output", "window_1", "input"},
+       {"measurements", "output", "window_2", "input"},
+       {"window_0", "output", "combine", "in_0"},
+       {"window_1", "output", "combine", "in_1"},
+       {"window_2", "output", "combine", "in_2"},
+       {"combine", "output", "output", "logical"}});
+
+  const auto reference_0 =
+      decoding_task_graph::from_spec(rep5_spec(5), "single_error_lut");
+  const auto reference_1 =
+      decoding_task_graph::from_spec(rep5_spec(5), "single_error_lut");
+  const auto reference_2 =
+      decoding_task_graph::from_spec(rep5_spec(5), "single_error_lut");
+  measurement_results shot;
+  shot.bits.resize(reference_0->get_num_msyn_per_decode());
+  for (std::size_t measurement_index = 0;
+       measurement_index < shot.bits.size(); ++measurement_index)
+    shot.bits[measurement_index] = (measurement_index % 3) == 1;
+
+  auto expected = xor_logical(reference_0->run(shot), reference_1->run(shot));
+  expected = xor_logical(expected, reference_2->run(shot));
+  const auto actual = graph->run(shot);
+
+  EXPECT_EQ(actual.bits, expected.bits);
+  EXPECT_EQ(actual.converged, expected.converged);
+} // end - TEST(DecodingTaskGraph, XorKindBuildsConfiguredThreeInputNode)
 
 // A scheduled contributor resumes its numbering after a consumed shot, so its
 // frontier does not count a shot's own rounds: a logical output fed by one
@@ -1240,6 +1479,138 @@ TEST(DecodingTaskGraph, StreamingNodeForwardsToNativeDecoderStream) {
   EXPECT_EQ(async_graph->get_obs_corrections()[0], 1u);
 }
 
+TEST(DecodingTaskGraph,
+     StreamingNodeRunAsyncValidatesAndProjectsMeasurementShot) {
+  auto decoder = std::make_unique<native_stream_probe_decoder>();
+  auto *probe = decoder.get();
+  task_graph_node_config node;
+  node.id = "native";
+  node.kind = "streaming";
+  node.d_sparse = {{0}, {1}, {2}, {3}};
+  node.o_sparse = {{0}};
+  node.node_params.insert("num_syndromes_per_round", std::size_t{1});
+  node.decoder_instance = std::move(decoder);
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(node));
+  auto graph = decoding_task_graph::from_topology(std::move(nodes));
+
+  measurement_results too_short;
+  too_short.bits = {1, 0, 0};
+  EXPECT_THROW((void)graph->run_async(too_short), std::out_of_range);
+  EXPECT_EQ(probe->decode_calls, 0u);
+
+  measurement_results measurements;
+  measurements.bits = {1, 0, 0, 0};
+  const auto result = graph->run_async(measurements).get();
+  EXPECT_TRUE(result.converged);
+  EXPECT_EQ(result.bits, (std::vector<uint8_t>{1}));
+  EXPECT_EQ(probe->decode_calls, 1u);
+  EXPECT_EQ(graph->inner_decoder(), probe);
+
+  graph->reset_decoder();
+  const auto reset_result = graph->run_async(measurements).get();
+  EXPECT_TRUE(reset_result.converged);
+  EXPECT_EQ(reset_result.bits, (std::vector<uint8_t>{1}));
+}
+
+TEST(DecodingTaskGraph, StreamingNodeAsyncAndNativePublicationAreIndependent) {
+  const auto detector_matrix = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(4, 4, {{0}, {1}, {2}, {3}}));
+  const auto observable_matrix = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(1, 1, {{0}}));
+  streaming_decoder_node node(
+      detector_matrix, observable_matrix,
+      std::make_unique<native_stream_probe_decoder>(), /*spr=*/1);
+
+  measurement_results measurements;
+  measurements.bits = {1, 0, 0, 0};
+
+  EXPECT_EQ(node.streaming_output(0), nullptr);
+  const auto one_shot = node.run_async(measurements).get();
+  EXPECT_TRUE(one_shot.converged);
+  EXPECT_EQ(one_shot.bits, (std::vector<uint8_t>{1}));
+  EXPECT_EQ(node.streaming_output(0), nullptr);
+  EXPECT_EQ(node.streaming_output(1), nullptr);
+
+  ASSERT_TRUE(node.enqueue(measurements.bits.data(), measurements.bits.size(),
+                           round_type::FINAL));
+  const auto *published = node.streaming_output(0);
+  ASSERT_NE(published, nullptr);
+  EXPECT_EQ(published->get<logical_outcome>().bits,
+            (std::vector<uint8_t>{1}));
+  EXPECT_EQ(node.streaming_output(1), nullptr);
+}
+
+TEST(DecodingTaskGraph, StreamingNodeRunAsyncRejectsWrongObservableWidth) {
+  class malformed_observable_decoder final
+      : public native_stream_probe_decoder {
+  public:
+    decoder_result decode(const std::vector<float_t> &syndrome) override {
+      auto result = native_stream_probe_decoder::decode(syndrome);
+      result.result.clear();
+      return result;
+    }
+  };
+
+  auto decoder = std::make_unique<malformed_observable_decoder>();
+  auto *probe = decoder.get();
+  task_graph_node_config node;
+  node.id = "native";
+  node.kind = "streaming";
+  node.d_sparse = {{0}, {1}, {2}, {3}};
+  node.o_sparse = {{0}};
+  node.node_params.insert("num_syndromes_per_round", std::size_t{1});
+  node.decoder_instance = std::move(decoder);
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(node));
+  auto graph = decoding_task_graph::from_topology(std::move(nodes));
+
+  measurement_results measurements;
+  measurements.bits = {1, 0, 0, 0};
+  EXPECT_THROW((void)graph->run_async(measurements).get(), std::out_of_range);
+  EXPECT_EQ(probe->decode_calls, 1u);
+}
+
+TEST(DecodingTaskGraph, StreamingNodeRunAsyncProjectsFaultValuedResults) {
+  class fixed_fault_result_decoder final : public decoder {
+  public:
+    explicit fixed_fault_result_decoder(std::vector<float_t> result)
+        : decoder(decoder_init(
+              sparse_binary_matrix::from_nested_csr(1, 3, {{0, 1, 2}}),
+              sparse_binary_matrix::from_nested_csr(2, 3, {{0, 1}, {1, 2}}),
+              {}, sparse_binary_matrix::from_nested_csr(1, 1, {{0}}))),
+          result_(std::move(result)) {}
+
+    decoder_result decode(const std::vector<float_t> &) override {
+      return decoder_result{true, result_};
+    }
+
+  private:
+    std::vector<float_t> result_;
+  };
+
+  const auto d = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(1, 1, {{0}}));
+  const auto o = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(2, 3, {{0, 1}, {1, 2}}));
+  auto make_node = [&](std::vector<float_t> result) {
+    return std::make_unique<streaming_decoder_node>(
+        d, o, std::make_unique<fixed_fault_result_decoder>(std::move(result)),
+        /*spr=*/1);
+  };
+
+  auto node = make_node({1, 1, 0});
+  measurement_results measurements;
+  measurements.bits = {1};
+  const auto outcome = node->run_async(measurements).get();
+  EXPECT_TRUE(outcome.converged);
+  EXPECT_EQ(outcome.bits, (std::vector<uint8_t>{0, 1}));
+
+  auto short_result_node = make_node({1, 0});
+  EXPECT_THROW((void)short_result_node->run_async(measurements).get(),
+               std::out_of_range);
+}
+
 TEST(DecodingTaskGraph, StreamingNodeFlushesNativeDecoderTail) {
   const auto run = [](bool async) {
     auto decoder = std::make_unique<native_stream_probe_decoder>(
@@ -1346,6 +1717,9 @@ TEST(DecodingTaskGraph, EmptyFinalIsRejectedBeforeTheDecoder) {
 class sealing_stream_probe_decoder : public native_stream_probe_decoder,
                                      public streaming_correction_provider {
 public:
+  explicit sealing_stream_probe_decoder(bool withhold_tail = false)
+      : native_stream_probe_decoder(withhold_tail) {}
+
   bool enqueue_syndrome(const uint8_t *input, std::size_t length,
                         round_type type) override {
     if (sealed_)
@@ -2558,6 +2932,60 @@ TEST(DecodingTaskGraph, ProvisionalUntaggedPublicationLeavesAFlush) {
   EXPECT_FALSE(node.flush());
 }
 
+TEST(DecodingTaskGraph, StreamingNodeExposesConstDecoderBackedCapability) {
+  const auto d = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(4, 4, {{0}, {1}, {2}, {3}}));
+  const auto o = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(1, 1, {{0}}));
+  streaming_decoder_node node(
+      d, o, std::make_unique<sealing_stream_probe_decoder>(), /*spr=*/1);
+  const task_graph_node &core = node;
+
+  const auto *decoder_backed = core.decoder_backed();
+  ASSERT_NE(decoder_backed, nullptr);
+  EXPECT_EQ(decoder_backed,
+            static_cast<const decoder_backed_task_graph_node *>(&node));
+}
+
+TEST(DecodingTaskGraph, StreamingNodeDeclaresOutputTypeOnlyForSlotZero) {
+  const auto d = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(4, 4, {{0}, {1}, {2}, {3}}));
+  const auto o = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(1, 1, {{0}}));
+  streaming_decoder_node node(
+      d, o, std::make_unique<sealing_stream_probe_decoder>(), /*spr=*/1);
+
+  EXPECT_EQ(node.output_type(0), edge_value_type("logical_outcome"));
+  EXPECT_FALSE(node.output_type(1).has_value());
+}
+
+TEST(DecodingTaskGraph, StreamingNodeEmptyEnqueueAndDeferredShotFlush) {
+  const auto d = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(4, 4, {{0}, {1}, {2}, {3}}));
+  const auto o = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(1, 1, {{0}}));
+  auto decoder = std::make_unique<sealing_stream_probe_decoder>(
+      /*withhold_tail=*/true);
+  auto *probe = decoder.get();
+  streaming_decoder_node node(d, o, std::move(decoder), /*spr=*/1);
+  EXPECT_EQ(node.streaming_output(0), nullptr);
+
+  const auto enqueue_calls_before_empty = probe->enqueue_calls;
+  EXPECT_FALSE(node.enqueue(nullptr, 0, round_type::BULK));
+  EXPECT_EQ(probe->enqueue_calls, enqueue_calls_before_empty);
+
+  const std::array<uint8_t, 4> shot{1, 0, 0, 0};
+  EXPECT_FALSE(node.enqueue_untagged(shot.data(), shot.size()));
+  EXPECT_EQ(probe->enqueue_calls, enqueue_calls_before_empty + 1);
+
+  ASSERT_TRUE(node.flush());
+  ASSERT_NE(node.streaming_output(0), nullptr);
+  EXPECT_EQ(node.streaming_output(1), nullptr);
+  EXPECT_EQ(node.streaming_output(0)->get<logical_outcome>().bits[0], 1);
+  EXPECT_EQ(probe->seals, 1u);
+  EXPECT_FALSE(node.flush());
+}
+
 // A node over rounds of different widths takes an untagged shot's rounds
 // from its template, so it must be given them.
 TEST(DecodingTaskGraph, StreamingNodeOverUnequalRoundsNeedsItsRoundCount) {
@@ -2735,6 +3163,23 @@ TEST(DecodingTaskGraph, DecodeTargetAnswersPerRoundSizeForBothKinds) {
   const decode_target decoder_target(dec.get());
   EXPECT_EQ(decoder_target.num_msyn_per_decode(), n_msyn);
   EXPECT_EQ(decoder_target.num_msyn_per_round(), n_msyn);
+}
+
+TEST(DecodingTaskGraph, DecodeTargetKindNamesBothTargetKinds) {
+  using cudaq::qec::detail_dispatch::decode_target;
+
+  auto graph =
+      decoding_task_graph::from_spec(rep5_streaming_spec(), "single_error_lut");
+  const decode_target graph_target(graph.get());
+  EXPECT_STREQ(graph_target.kind(), "Task graph");
+
+  const auto inputs = make_rep3_inputs();
+  const cudaqx::heterogeneous_map params;
+  auto dec =
+      get_decoder("single_error_lut",
+                  decoder_init(inputs.closed, make_csr(inputs.d, "D")), params);
+  const decode_target decoder_target(dec.get());
+  EXPECT_STREQ(decoder_target.kind(), "Decoder");
 }
 
 TEST(DecodingTaskGraph, DecodeTargetBudgetsOnlyADecoder) {
@@ -4290,6 +4735,8 @@ TEST(DecodingTaskGraph, EnsembleYamlParsesRoundTripsAndLowers) {
       cudaq::qec::decoding::host::build_task_graph(multi_config.decoders.at(0));
   ASSERT_NE(g, nullptr);
   EXPECT_EQ(g->run(measurement_results{{0, 0}}).bits, std::vector<uint8_t>{0});
+  g->reset_decoder();
+  EXPECT_EQ(g->run(measurement_results{{0, 0}}).bits, std::vector<uint8_t>{0});
 }
 
 TEST(DecodingTaskGraph, EnsembleStreamsOnTheServerPathBehindAPredecoder) {
@@ -4355,6 +4802,157 @@ decoders:
 )"));
   EXPECT_NE(cfg::configure_decoders(raw), 0);
   cfg::finalize_decoders();
+}
+
+TEST(DecodingTaskGraph, EnsembleJoinDerivesStreamingSchedule) {
+  namespace cfg = cudaq::qec::decoding::config;
+  namespace h = cudaq::qec::decoding::host;
+
+  const std::string yaml = R"(
+decoders:
+  - id: 0
+    task_graph:
+      nodes:
+        - id: pre
+          type: predecoder
+          window_size: 5
+          residual_from: parity_check
+          inner: {type: single_error_lut}
+        - id: ens
+          type: ensemble
+          join_strategy: deadline
+          join_params: {deadline_us: 500000}
+          members:
+            - nodes:
+                - {id: a, type: single_window, window_size: 5, push_candidates: true, cancellable: true, inner: {type: single_error_lut}}
+              edges: [{from: input, to: a}]
+            - nodes:
+                - {id: b, type: single_window, window_size: 5, inner: {type: multi_error_lut, lut_error_depth: 2}}
+              edges: [{from: input, to: b}, {from: b, to: output}]
+        - id: combine
+          type: xor
+      edges:
+        - {from: measurements, to: pre}
+        - {from: pre.residual, to: ens}
+        - {from: pre.pre_L, to: combine.a}
+        - {from: ens, to: combine.b}
+        - {from: combine, to: output}
+    dem_chunks:
+)" + rep5_phase_block("      ");
+
+  auto parsed = cfg::multi_decoder_config::from_yaml_str(yaml);
+  auto graph = h::build_task_graph(parsed.decoders.at(0));
+  ASSERT_NE(graph, nullptr);
+  EXPECT_TRUE(graph->supports_streaming());
+  ASSERT_EQ(graph->get_num_observables(), 1u);
+
+  measurement_results zeros;
+  zeros.bits.assign(graph->get_num_msyn_per_decode(), 0);
+  const auto outcome = graph->run(zeros);
+  EXPECT_TRUE(outcome.converged);
+  EXPECT_EQ(outcome.bits, (std::vector<uint8_t>{0}));
+}
+
+TEST(DecodingTaskGraph, CandidatePushRejectsRawEnqueue) {
+  std::unique_ptr<task_graph_node> node;
+  {
+    auto registry_lock = lock_node_kind_registry();
+    const auto *factory = find_node_factory("candidate_push");
+    ASSERT_NE(factory, nullptr);
+    node_build_context context;
+    context.id = "member";
+    node = (*factory)(context);
+  }
+  ASSERT_NE(node, nullptr);
+  auto *streaming = node->streaming();
+  ASSERT_NE(streaming, nullptr);
+  EXPECT_EQ(streaming->corrections(), nullptr);
+  const std::uint8_t raw[] = {1};
+  EXPECT_FALSE(streaming->enqueue(raw, sizeof(raw), round_type::BULK));
+}
+
+TEST(DecodingTaskGraph, EnsembleJoinReportsNoRawMeasurementWidth) {
+  const cudaqx::heterogeneous_map params{
+      {"done_inputs", std::size_t{1}},
+      {"num_observables", std::size_t{1}}};
+  std::unique_ptr<task_graph_node> node;
+  {
+    auto registry_lock = lock_node_kind_registry();
+    const auto *factory = find_node_factory("ensemble_join");
+    ASSERT_NE(factory, nullptr);
+    node_build_context context;
+    context.id = "join";
+    context.node_params = &params;
+    node = (*factory)(context);
+  }
+  ASSERT_NE(node, nullptr);
+  auto *streaming = node->streaming();
+  ASSERT_NE(streaming, nullptr);
+  EXPECT_EQ(streaming->num_observables(), 1u);
+  EXPECT_EQ(streaming->num_msyn_per_decode(), 0u);
+}
+
+TEST(DecodingTaskGraph, EnsembleLoweredStreamingContracts) {
+  const cudaqx::heterogeneous_map fanout_params{
+      {"strategy", std::string{"first"}}};
+  std::unique_ptr<task_graph_node> fanout_node;
+  {
+    auto registry_lock = lock_node_kind_registry();
+    const auto *factory = find_node_factory("ensemble_fanout");
+    ASSERT_NE(factory, nullptr);
+    node_build_context context;
+    context.id = "fanout";
+    context.node_params = &fanout_params;
+    fanout_node = (*factory)(context);
+  }
+  ASSERT_NE(fanout_node, nullptr);
+  auto *fanout = fanout_node->streaming();
+  ASSERT_NE(fanout, nullptr);
+  std::uint8_t raw_byte = 0;
+  EXPECT_EQ(fanout->num_msyn_per_decode(), 0u);
+  EXPECT_FALSE(fanout->enqueue(&raw_byte, 0, round_type::FINAL));
+  EXPECT_EQ(fanout->corrections(), nullptr);
+
+  std::unique_ptr<task_graph_node> candidate_node;
+  {
+    auto registry_lock = lock_node_kind_registry();
+    const auto *factory = find_node_factory("candidate_push");
+    ASSERT_NE(factory, nullptr);
+    node_build_context context;
+    context.id = "candidate";
+    candidate_node = (*factory)(context);
+  }
+  ASSERT_NE(candidate_node, nullptr);
+  auto *candidate = candidate_node->streaming();
+  ASSERT_NE(candidate, nullptr);
+  EXPECT_EQ(candidate->num_msyn_per_decode(), 0u);
+  EXPECT_FALSE(candidate->enqueue(&raw_byte, 0, round_type::FINAL));
+  EXPECT_EQ(candidate->corrections(), nullptr);
+  EXPECT_NO_THROW(candidate->reset_streaming_state());
+
+  const cudaqx::heterogeneous_map join_params{
+      {"done_inputs", std::size_t{1}},
+      {"num_observables", std::size_t{1}}};
+  std::unique_ptr<task_graph_node> join_node;
+  {
+    auto registry_lock = lock_node_kind_registry();
+    const auto *factory = find_node_factory("ensemble_join");
+    ASSERT_NE(factory, nullptr);
+    node_build_context context;
+    context.id = "join";
+    context.node_params = &join_params;
+    join_node = (*factory)(context);
+  }
+  ASSERT_NE(join_node, nullptr);
+  auto *join = join_node->streaming();
+  ASSERT_NE(join, nullptr);
+  EXPECT_EQ(join->num_msyn_per_decode(), 0u);
+  ASSERT_EQ(join->num_observables(), 1u);
+  const auto *join_corrections = join->corrections();
+  ASSERT_NE(join_corrections, nullptr);
+  EXPECT_EQ(join_corrections[0], 0);
+  EXPECT_EQ(join->streaming_output(0), nullptr);
+  EXPECT_FALSE(join->enqueue(&raw_byte, 0, round_type::FINAL));
 }
 
 TEST(DecodingTaskGraph, EnsembleYamlRejectsLoweredKindsAndBadPatterns) {
@@ -4635,6 +5233,73 @@ TEST(DecodingTaskGraph, WindowNodeExposesItsCapabilities) {
 
   EXPECT_EQ(core->streaming(), node.get());
   EXPECT_EQ(core->decoder_backed(), node.get());
+
+  const task_graph_node &const_core = *node;
+  EXPECT_EQ(const_core.decoder_backed(),
+            static_cast<const decoder_backed_task_graph_node *>(node.get()));
+}
+
+TEST(DecodingTaskGraph, WindowNodeReportsConfiguredStreamingSchedule) {
+  const auto inp = make_rep3_inputs();
+  const auto n = static_cast<uint32_t>(make_csr(inp.d, "D").num_cols());
+  ASSERT_GT(n, 1u);
+  const window_spec configured{n, n - 1, 0u, 0u};
+  auto node = make_rep3_window_node(inp, configured, 1u);
+
+  const auto schedule = node->streaming()->streaming_schedule();
+  ASSERT_TRUE(schedule.has_value());
+  EXPECT_EQ(*schedule, configured);
+}
+
+TEST(DecodingTaskGraph, WindowNodeReportsOutputValueSize) {
+  const auto inp = make_rep3_inputs();
+  const auto n = static_cast<uint32_t>(make_csr(inp.d, "D").num_cols());
+  auto node = make_rep3_window_node(inp, {n, n, 0u, 0u}, 1u);
+
+  EXPECT_EQ(node->output_value_size(0),
+            std::optional<std::size_t>{inp.o.size()});
+  EXPECT_FALSE(node->output_value_size(1).has_value());
+}
+
+TEST(DecodingTaskGraph, WindowNodeRejectsDuplicateDataInputSchedules) {
+  const auto inp = make_rep3_inputs();
+  const auto n = static_cast<uint32_t>(make_csr(inp.d, "D").num_cols());
+  auto node = make_rep3_window_node(inp, {n, n, 0u, 0u}, 1u);
+  const window_spec schedule{n, n, 0u, 0u};
+
+  const std::vector<streaming_task_graph_node::input_schedule> one_input{
+      {0, schedule}};
+  const auto derived = node->derive_streaming_schedule(0, one_input);
+  ASSERT_TRUE(derived);
+  EXPECT_EQ(*derived, schedule);
+
+  const std::vector<streaming_task_graph_node::input_schedule> duplicate_inputs{
+      {0, schedule}, {0, schedule}};
+  EXPECT_FALSE(node->derive_streaming_schedule(0, duplicate_inputs));
+}
+
+TEST(DecodingTaskGraph, WindowNodeExposesObservableMatrixPointer) {
+  const auto inp = make_rep3_inputs();
+  const auto n = static_cast<uint32_t>(make_csr(inp.d, "D").num_cols());
+  auto node = make_rep3_window_node(inp, {n, n, 0u, 0u}, 1u);
+
+  const auto observable_matrix = node->o_ptr();
+  ASSERT_NE(observable_matrix, nullptr);
+  EXPECT_EQ(observable_matrix.get(), &node->o());
+}
+
+TEST(DecodingTaskGraph, WindowNodeDPtrReturnsSharedMatrix) {
+  const auto inp = make_rep3_inputs();
+  const auto n = static_cast<uint32_t>(make_csr(inp.d, "D").num_cols());
+  auto node = make_rep3_window_node(inp, {n, n, 0u, 0u}, 1u);
+  const auto expected_d = make_csr(inp.d, "D").to_nested_csr();
+
+  auto d_ptr = node->d_ptr();
+  ASSERT_NE(d_ptr, nullptr);
+  EXPECT_EQ(d_ptr.get(), &node->d());
+
+  node.reset();
+  EXPECT_EQ(d_ptr->to_nested_csr(), expected_d);
 }
 
 TEST(DecodingTaskGraph, WindowNodeDeclaresPortTypes) {
@@ -4946,6 +5611,17 @@ static std::unique_ptr<predecoder_node> make_chain_predecoder(
                                            /*spr=*/4, /*rounds=*/1);
 }
 
+TEST(DecodingTaskGraph, PredecoderExposesConstDecoderBackedCapability) {
+  auto node = make_chain_predecoder({0, 0, 0, 0, 0});
+  EXPECT_FALSE(node->supports_fire_pool());
+  const task_graph_node &core = *node;
+
+  const auto *decoder_backed = core.decoder_backed();
+  ASSERT_NE(decoder_backed, nullptr);
+  EXPECT_EQ(decoder_backed,
+            static_cast<const decoder_backed_task_graph_node *>(node.get()));
+}
+
 TEST(DecodingTaskGraph, PredecoderDeclaresPreLAndResidualPorts) {
   auto node = make_chain_predecoder({0, 0, 0, 0, 0});
   EXPECT_EQ(node->inputs(), (std::vector<std::string>{"input"}));
@@ -4961,6 +5637,13 @@ TEST(DecodingTaskGraph, PredecoderDeclaresPreLAndResidualPorts) {
   EXPECT_FALSE(node->supports_raw_streaming_input(1));
   // Raw-fed: an edge into it is a build-time error.
   EXPECT_FALSE(node->supports_streaming_input(0));
+}
+
+TEST(DecodingTaskGraph, PredecoderReportsOutputValueSizes) {
+  auto node = make_chain_predecoder({0, 0, 0, 0, 0});
+  EXPECT_EQ(node->output_value_size(0), std::optional<std::size_t>{1});
+  EXPECT_EQ(node->output_value_size(1), std::optional<std::size_t>{4});
+  EXPECT_FALSE(node->output_value_size(2).has_value());
 }
 
 TEST(DecodingTaskGraph, PredecoderResidualIsTheUnexplainedSyndrome) {
@@ -4982,6 +5665,26 @@ TEST(DecodingTaskGraph, PredecoderResidualIsTheUnexplainedSyndrome) {
   // fails, as does a commit hardwired to zero.
   ASSERT_NE((std::vector<float_t>{0, 0, 0, 1}),
             (std::vector<float_t>{1, 0, 0, 1}));
+}
+
+TEST(DecodingTaskGraph,
+     PredecoderRejectsOversizedChunkAndPreservesPartialWindow) {
+  auto node = make_chain_predecoder({1, 0, 0, 0, 0});
+  const uint8_t first = 1;
+  ASSERT_FALSE(node->enqueue(&first, 1, round_type::BULK));
+
+  const uint8_t oversized[4] = {0, 1, 1, 1};
+  EXPECT_FALSE(node->enqueue(oversized, 4, round_type::BULK));
+  EXPECT_EQ(node->streaming_output(0), nullptr);
+  EXPECT_EQ(node->streaming_output(1), nullptr);
+
+  const uint8_t remaining[3] = {0, 0, 0};
+  ASSERT_TRUE(node->enqueue(remaining, 3, round_type::BULK));
+  EXPECT_EQ(node->streaming_output(0)->get<logical_outcome>().bits,
+            (std::vector<uint8_t>{1}));
+  EXPECT_EQ(node->streaming_output(1)->get<detection_events>().bits,
+            (std::vector<float_t>{0, 0, 0, 0}));
+  EXPECT_EQ(node->corrections()[0], 1u);
 }
 
 TEST(DecodingTaskGraph, PredecoderAbstainsWhenTheDecodeDoesNotConverge) {
@@ -5122,6 +5825,37 @@ TEST(DecodingTaskGraph, PredecoderParamsAreSchemaChecked) {
   bad.insert("window_size", std::size_t{0});
   EXPECT_THROW(
       cfg::validate_custom_args(task_graph_node_schema_name("predecoder"), bad),
+      std::runtime_error);
+}
+
+TEST(DecodingTaskGraph, SingleWindowParamsAreSchemaChecked) {
+  namespace cfg = cudaq::qec::decoding::config;
+  const auto *schema =
+      cfg::find_decoder_schema(task_graph_node_schema_name("single_window"));
+  ASSERT_NE(schema, nullptr);
+
+  std::vector<std::string> keys;
+  for (const auto &param : schema->params)
+    keys.push_back(param.key);
+  std::sort(keys.begin(), keys.end());
+  EXPECT_EQ(keys, (std::vector<std::string>{"cancellable",
+                                            "num_syndromes_per_round",
+                                            "push_candidates", "window_size"}));
+
+  cudaqx::heterogeneous_map good;
+  good.insert("window_size", std::size_t{5});
+  EXPECT_NO_THROW(cfg::validate_custom_args(*schema, good, "single_window"));
+
+  cudaqx::heterogeneous_map zero_size;
+  zero_size.insert("window_size", std::size_t{0});
+  EXPECT_THROW(
+      cfg::validate_custom_args(*schema, zero_size, "single_window"),
+      std::runtime_error);
+
+  cudaqx::heterogeneous_map sliding_only;
+  sliding_only.insert("step_size", std::size_t{1});
+  EXPECT_THROW(
+      cfg::validate_custom_args(*schema, sliding_only, "single_window"),
       std::runtime_error);
 }
 
@@ -5783,6 +6517,17 @@ uint8_t stream_shot(decoding_task_graph &g, const std::vector<uint8_t> &m) {
 }
 
 } // namespace
+
+TEST(DecodingTaskGraph, SingleNodeTopologyInfersFirstOutput) {
+  auto graph = build_pre_only_graph();
+
+  measurement_results measurements;
+  measurements.bits.assign(graph->get_num_msyn_per_decode(), 0);
+  const auto result = graph->run(measurements);
+
+  EXPECT_TRUE(result.converged);
+  EXPECT_EQ(result.bits, (std::vector<uint8_t>{0}));
+}
 
 TEST(DecodingTaskGraph, ResidualTopologySplitsWorkBetweenPreAndGlobal) {
   const auto model = rep5_model::build();
@@ -6717,6 +7462,62 @@ TEST(DecodingTaskGraph, EdgeFedWindowStreamMatchesTheRawByteStream) {
                            edged->corrections() + rounds));
 }
 
+class cancellable_window_probe_decoder final : public decoder {
+public:
+  explicit cancellable_window_probe_decoder(sparse_binary_matrix h)
+      : decoder(decoder_init(std::move(h))) {}
+
+  decoder_result decode(const std::vector<float_t> &) override {
+    return decoder_result{true, {1.0f}};
+  }
+
+  std::optional<decoder_result>
+  decode(const std::vector<float_t> &, cancellation_token token) override {
+    stopped_tokens.push_back(token.stop_requested());
+    if (stopped_tokens.back())
+      return std::nullopt;
+    return decoder_result{true, {1.0f}};
+  }
+
+  std::vector<bool> stopped_tokens;
+};
+
+TEST(DecodingTaskGraph, WindowNodeFireLeavesStateUntouchedWhenDecodeStops) {
+  const auto identity = sparse_binary_matrix::from_nested_csr(1, 1, {{0}});
+  auto d = std::make_shared<sparse_binary_matrix>(identity);
+  auto o = std::make_shared<sparse_binary_matrix>(identity);
+  auto inner_decoder =
+      std::make_unique<cancellable_window_probe_decoder>(identity);
+  auto *probe = inner_decoder.get();
+  window_node node(d, o, std::move(inner_decoder), /*spr=*/1,
+                   window_spec{1, 1, 0, 0}, {}, /*num_measurements=*/0,
+                   /*push_candidates=*/false, /*cancellable=*/true);
+
+  detection_events dets;
+  dets.bits = {1.0f};
+  cancellation_source stopped_source;
+  ASSERT_TRUE(stopped_source.request_soft_stop());
+  node.enqueue_edge_value(edge_value{stopped_source.get_token()}, 1);
+
+  EXPECT_FALSE(node.enqueue_edge_value(edge_value{dets}, 0));
+  ASSERT_EQ(probe->stopped_tokens.size(), 1u);
+  EXPECT_TRUE(probe->stopped_tokens[0]);
+  EXPECT_EQ(node.streaming_output(0), nullptr);
+  EXPECT_EQ(node.corrections()[0], 0u);
+
+  cancellation_source live_source;
+  node.enqueue_edge_value(edge_value{live_source.get_token()}, 1);
+  EXPECT_TRUE(node.enqueue_edge_value(edge_value{dets}, 0));
+  ASSERT_EQ(probe->stopped_tokens.size(), 2u);
+  EXPECT_FALSE(probe->stopped_tokens[1]);
+  const auto *out = node.streaming_output(0);
+  ASSERT_NE(out, nullptr);
+  const auto &lo = out->get<logical_outcome>();
+  EXPECT_TRUE(lo.converged);
+  EXPECT_EQ(lo.bits, (std::vector<uint8_t>{1}));
+  EXPECT_EQ(node.corrections()[0], 1u);
+}
+
 // Emits detection_events on its output slot. No shipped kind does yet, so
 // this is the only way to build a `measurements -> producer -> window`
 // topology and
@@ -6791,6 +7592,14 @@ private:
   std::size_t bytes_in_ = 0;
   bool fired_ = false;
 };
+
+TEST(DecodingTaskGraph, EdgeEnqueueDefaultsToUnsupported) {
+  detector_source_node source(1, 1, 1, {1, 1, 0, 0});
+  streaming_task_graph_node &stream = source;
+  EXPECT_FALSE(stream.supports_streaming_input(0));
+  const edge_value value{detection_events{{1.0f}}};
+  EXPECT_FALSE(stream.enqueue_edge_value(value, 0));
+}
 
 static const bool detector_source_registered = [] {
   task_graph_node_kind_spec spec;
@@ -8023,6 +8832,94 @@ static std::unique_ptr<decoding_task_graph> make_arbitrary_memory_graph(
   return decoding_task_graph::from_topology(std::move(nodes), {}, options);
 }
 
+TEST(ArbitraryLengthMemory,
+     SupportsGraphDispatchIsFalseForArbitraryLengthWindow) {
+  auto graph = make_arbitrary_memory_graph();
+  EXPECT_FALSE(graph->supports_graph_dispatch());
+}
+
+TEST(ArbitraryLengthMemory, RegisteredWindowKindsAndImplicitGuards) {
+  constexpr std::size_t window_size = 5;
+  const auto spec = arbitrary_memory_spec(window_size);
+  auto oracle = decoding_task_graph::from_spec(spec, "single_error_lut");
+  std::vector<uint8_t> shot(window_size * 4);
+  shot[16] = 1;
+  const auto expected = oracle->run(measurement_results{shot});
+  ASSERT_EQ(expected.bits, (std::vector<uint8_t>{1}));
+
+  for (const auto *kind : {"single_window", "sliding_window"}) {
+    task_graph_node_config node;
+    node.id = "window";
+    node.kind = kind;
+    node.dem = spec;
+    node.decoder_type = "single_error_lut";
+    node.node_params = {{"window_size", window_size}};
+    if (node.kind == "sliding_window")
+      node.node_params.insert("step_size", window_size);
+    std::vector<task_graph_node_config> nodes;
+    nodes.push_back(std::move(node));
+
+    auto graph = decoding_task_graph::from_topology(std::move(nodes));
+    EXPECT_EQ(graph->run(measurement_results{shot}).bits, expected.bits) << kind;
+  }
+
+  task_graph_node_config memory;
+  memory.id = "memory";
+  memory.kind = "sliding_window";
+  memory.dem = spec;
+  memory.decoder_type = "single_error_lut";
+  memory.node_params = {{"window_size", window_size},
+                        {"step_size", std::size_t{3}},
+                        {"arbitrary_length", true}};
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(memory));
+  auto graph = decoding_task_graph::from_topology(std::move(nodes));
+
+  ASSERT_TRUE(graph->enqueue_syndrome(shot.data(), shot.size(),
+                                      round_type::FINAL));
+  EXPECT_EQ(graph->get_obs_corrections()[0], expected.bits[0]);
+  const auto progress = graph->streaming_result();
+  ASSERT_EQ(progress.outputs.size(), 1u);
+  EXPECT_EQ(progress.outputs[0].coverage_end_round, window_size);
+}
+
+TEST(ArbitraryLengthMemory, UsesSpecMeasurementWidthForImplicitPhase) {
+  constexpr std::size_t window_size = 5;
+  auto spec = arbitrary_memory_spec(window_size, true);
+  spec.measurements_per_round = 4;
+  for (auto &phase : spec.phases)
+    if (phase.id == phase_name::dem_init)
+      phase.spec.num_measurements.reset();
+
+  task_graph_node_config node;
+  node.id = "window";
+  node.kind = "sliding_window";
+  node.dem = spec;
+  node.decoder_type = "single_error_lut";
+  node.node_params = {{"window_size", window_size},
+                      {"step_size", std::size_t{3}},
+                      {"start_guard", std::size_t{1}},
+                      {"end_guard", std::size_t{1}},
+                      {"arbitrary_length", true}};
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(node));
+  auto graph = decoding_task_graph::from_topology(std::move(nodes));
+
+  auto oracle = decoding_task_graph::from_spec(spec, "single_error_lut");
+  std::vector<uint8_t> shot(window_size * 4);
+  shot[16] = 1;
+  const auto expected = oracle->run(measurement_results{shot});
+  ASSERT_EQ(expected.bits, (std::vector<uint8_t>{1}));
+
+  ASSERT_TRUE(graph->enqueue_syndrome(shot.data(), shot.size(),
+                                      round_type::FINAL));
+  EXPECT_EQ(graph->get_obs_corrections()[0], expected.bits[0]);
+  const auto progress = graph->streaming_result();
+  EXPECT_EQ(progress.status, task_graph_streaming_status::complete);
+  ASSERT_EQ(progress.outputs.size(), 1u);
+  EXPECT_EQ(progress.outputs[0].coverage_end_round, window_size);
+}
+
 TEST(ArbitraryLengthMemory, PyMatchingEveryFaultAndByteFragmentMatchesOracle) {
   const cudaqx::heterogeneous_map params{
       {"merge_strategy", std::string{"independent"}}};
@@ -8408,6 +9305,174 @@ TEST(ArbitraryLengthMemory, FiniteShotRunUsesTheConfiguredClosedWindow) {
   ASSERT_EQ(expected.bits[0], 1);
   EXPECT_EQ(graph->get_num_msyn_per_decode(), shot.size());
   EXPECT_EQ(graph->run(measurement_results{shot}).bits, expected.bits);
+}
+
+class memory_window_failure_probe_decoder final : public decoder {
+public:
+  memory_window_failure_probe_decoder(
+      decoder_init inputs, decoder_output_request output,
+      const cudaqx::heterogeneous_map &)
+      : decoder(std::move(inputs), output) {}
+
+  decoder_result decode(const std::vector<float_t> &) override {
+    if (fail_next.exchange(false))
+      throw std::runtime_error("memory-window failure probe decode");
+    return decoder_result{true, std::vector<float_t>(block_size, 0.0f)};
+  }
+
+  static std::atomic<bool> fail_next;
+
+  CUDAQ_EXTENSION_CUSTOM_CREATOR_FUNCTION(
+      memory_window_failure_probe_decoder,
+      static std::unique_ptr<decoder> create(
+          decoder_init inputs, std::optional<decoder_output_request> output,
+          const cudaqx::heterogeneous_map &params) {
+        return std::make_unique<memory_window_failure_probe_decoder>(
+            std::move(inputs),
+            output.value_or(decoder_output_request{decode_result_type::errors}),
+            params);
+      })
+};
+std::atomic<bool> memory_window_failure_probe_decoder::fail_next{false};
+CUDAQ_EXT_PT_REGISTER_TYPE(memory_window_failure_probe_decoder)
+
+static const bool memory_window_failure_probe_schema_registered = [] {
+  decoding::config::register_decoder_schema(
+      {"memory_window_failure_probe_decoder", {}});
+  return true;
+}();
+
+TEST(ArbitraryLengthMemory, RejectsWholeWindowEdgeInput) {
+  constexpr std::size_t window = 5, width = 4;
+  auto spec = arbitrary_memory_spec(window);
+  const auto chunks = dem_chunks_from_spec(spec);
+  const auto closed =
+      dem_close_all(chunks, spec.seam.from_seam, spec.seam.to_seam);
+  const auto rows = dem_chunks_to_d_sparse(spec);
+  node_build_context ctx;
+  ctx.memory_spec = std::make_shared<const dem_chunks_spec>(spec);
+  ctx.d = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(rows.size(), window * width, rows));
+  ctx.o = std::make_shared<const sparse_binary_matrix>(
+      closed.observables_flips_matrix, sparse_binary_matrix_layout::csr);
+  ctx.decoder_type = "single_error_lut";
+  ctx.dec = get_decoder(
+      ctx.decoder_type,
+      decoder_init(closed.detector_error_matrix, std::nullopt,
+                   closed.error_rates),
+      decoder_output_request{decode_result_type::errors});
+  ctx.spr = width;
+  memory_window_node node(ctx, {window, 3, 1, 1});
+
+  EXPECT_THROW(node.validate_edge_input(0), std::invalid_argument);
+
+  detection_events dets;
+  dets.bits.assign(rows.size(), 0.0f);
+  EXPECT_THROW(node.enqueue_edge_value(edge_value{dets}, 0),
+               std::invalid_argument);
+}
+
+TEST(ArbitraryLengthMemory,
+     MemoryWindowCapabilityOverridesRejectStreamingAndGraphDispatch) {
+  constexpr std::size_t window = 5, width = 4;
+  auto spec = arbitrary_memory_spec(window);
+  const auto chunks = dem_chunks_from_spec(spec);
+  const auto closed =
+      dem_close_all(chunks, spec.seam.from_seam, spec.seam.to_seam);
+  const auto rows = dem_chunks_to_d_sparse(spec);
+  node_build_context ctx;
+  ctx.memory_spec = std::make_shared<const dem_chunks_spec>(spec);
+  ctx.d = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(rows.size(), window * width, rows));
+  ctx.o = std::make_shared<const sparse_binary_matrix>(
+      closed.observables_flips_matrix, sparse_binary_matrix_layout::csr);
+  ctx.decoder_type = "single_error_lut";
+  ctx.dec = get_decoder(
+      ctx.decoder_type,
+      decoder_init(closed.detector_error_matrix, std::nullopt,
+                   closed.error_rates),
+      decoder_output_request{decode_result_type::errors});
+  ctx.spr = width;
+  memory_window_node node(ctx, {window, 3, 1, 1});
+
+  const streaming_task_graph_node &streaming = node;
+  const decoder_backed_task_graph_node &decoder_backed = node;
+  EXPECT_FALSE(streaming.supports_streaming_input(0));
+  EXPECT_FALSE(decoder_backed.supports_graph_dispatch());
+}
+
+TEST(ArbitraryLengthMemory,
+     DecodeFailuresLatchUntilResetAndFlushIsIdempotent) {
+  constexpr std::size_t window = 5, width = 4;
+  auto spec = arbitrary_memory_spec(window);
+  const auto chunks = dem_chunks_from_spec(spec);
+  const auto closed =
+      dem_close_all(chunks, spec.seam.from_seam, spec.seam.to_seam);
+  const auto rows = dem_chunks_to_d_sparse(spec);
+  node_build_context ctx;
+  ctx.memory_spec = std::make_shared<const dem_chunks_spec>(spec);
+  ctx.d = std::make_shared<const sparse_binary_matrix>(
+      sparse_binary_matrix::from_nested_csr(rows.size(), window * width, rows));
+  ctx.o = std::make_shared<const sparse_binary_matrix>(
+      closed.observables_flips_matrix, sparse_binary_matrix_layout::csr);
+  ctx.decoder_type = "memory_window_failure_probe_decoder";
+  ctx.dec = get_decoder(
+      ctx.decoder_type,
+      decoder_init(closed.detector_error_matrix, std::nullopt,
+                   closed.error_rates),
+      decoder_output_request{decode_result_type::errors});
+  ctx.spr = width;
+  memory_window_node node(ctx, {window, 3, 1, 1});
+  EXPECT_FALSE(node.supports_streaming_input(0));
+
+  const std::array<uint8_t, width> record{};
+  EXPECT_THROW(node.flush(), std::invalid_argument);
+  EXPECT_THROW(node.enqueue(record.data(), record.size(), round_type::BULK),
+               std::logic_error);
+  node.reset_streaming_state();
+
+  for (std::size_t round = 0; round < 4; ++round)
+    EXPECT_NO_THROW(node.enqueue(record.data(), record.size(),
+                                 round_type::BULK));
+  memory_window_failure_probe_decoder::fail_next = true;
+  try {
+    node.enqueue(record.data(), record.size(), round_type::BULK);
+    FAIL() << "expected enqueue-triggered decode failure";
+  } catch (const std::runtime_error &error) {
+    EXPECT_STREQ(error.what(), "memory-window failure probe decode");
+  }
+  EXPECT_THROW(node.enqueue(record.data(), record.size(), round_type::BULK),
+               std::logic_error);
+  node.reset_streaming_state();
+
+  const auto shot_length = spec.minimum_rounds();
+  std::vector<std::array<uint8_t, width>> shot(shot_length);
+  for (std::size_t round = 0; round < shot.size(); ++round)
+    node.enqueue(shot[round].data(), shot[round].size(),
+                 round + 1 == shot.size() ? round_type::FINAL
+                                          : round_type::BULK);
+  memory_window_failure_probe_decoder::fail_next = true;
+  try {
+    node.flush();
+    FAIL() << "expected terminal decode failure";
+  } catch (const std::runtime_error &error) {
+    EXPECT_STREQ(error.what(), "memory-window failure probe decode");
+  }
+  EXPECT_THROW(node.flush(), std::logic_error);
+  node.reset_streaming_state();
+
+  for (std::size_t round = 0; round < shot.size(); ++round)
+    node.enqueue(shot[round].data(), shot[round].size(),
+                 round + 1 == shot.size() ? round_type::FINAL
+                                          : round_type::BULK);
+  ASSERT_TRUE(node.flush());
+  const auto num_observables = closed.observables_flips_matrix.shape().at(0);
+  EXPECT_EQ(std::vector<uint8_t>(node.corrections(),
+                                 node.corrections() + num_observables),
+            std::vector<uint8_t>{0});
+  ASSERT_TRUE(node.streaming_coverage());
+  EXPECT_EQ(node.streaming_coverage()->end_round, shot_length);
+  EXPECT_FALSE(node.flush());
 }
 
 TEST(ArbitraryLengthMemory, PreparedModelAndRingCountsStayFixed) {
@@ -10068,6 +11133,13 @@ TEST(DecodingTaskGraph, XorNodeTakesNeitherDecoderNorDem) {
                std::invalid_argument);
 }
 
+TEST(DecodingTaskGraph, XorNodeOutputTypeRejectsUndeclaredSlot) {
+  const xor_node node;
+  EXPECT_EQ(node.outputs(), (std::vector<std::string>{"output"}));
+  EXPECT_EQ(node.output_type(0), edge_value_type("logical_outcome"));
+  EXPECT_FALSE(node.output_type(1).has_value());
+}
+
 TEST(DecodingTaskGraph, GuardedNodeBuildsThroughTopologyAndStreams) {
   std::vector<task_graph_node_config> nodes;
   auto node = rep5_streaming_node();
@@ -10259,6 +11331,30 @@ private:
   edge_value val_;
 };
 
+class ensemble_candidate_node : public task_graph_node {
+public:
+  void execute_indexed(const std::vector<edge_value> &inputs,
+                       std::vector<edge_value> &) const override {
+    static_cast<void>(inputs[0].get<measurement_results>());
+    logical_outcome outcome;
+    outcome.converged = true;
+    outcome.bits = {1};
+    inputs[1].get<candidate_sink>().push(std::move(outcome), "candidate");
+  }
+  std::vector<std::string> inputs() const override {
+    return {"input", "sink"};
+  }
+  std::vector<std::string> outputs() const override { return {}; }
+  bool accepts_input_type(std::size_t slot,
+                          edge_value_type type) const override {
+    if (slot == 0)
+      return type == edge_value_type("measurement_results");
+    if (slot == 1)
+      return type == edge_value_type::of<candidate_sink>();
+    return false;
+  }
+};
+
 /// test_dummy_value in, logical_outcome out: one bit, the payload's parity.
 /// While streaming, each routed payload's parity folds into the correction.
 class dummy_sink_node : public one_shot_test_node {
@@ -10327,6 +11423,27 @@ public:
   }
 };
 
+class logical_only_test_node final : public task_graph_node {
+public:
+  void execute_indexed(const std::vector<edge_value> &,
+                       std::vector<edge_value> &) const override {
+    throw std::logic_error("logical-only test node must be skipped");
+  }
+  std::vector<std::string> inputs() const override { return {"input"}; }
+  std::vector<std::string> outputs() const override { return {"output"}; }
+  std::optional<edge_value_type>
+  output_type(std::size_t slot) const override {
+    if (slot == 0)
+      return edge_value_type("logical_outcome");
+    return std::nullopt;
+  }
+  bool accepts_input_type(std::size_t slot,
+                          edge_value_type type) const override {
+    return slot == 0 && type == edge_value_type("measurement_results");
+  }
+  bool reads_logical() const override { return true; }
+};
+
 static void register_one_shot_test_kind(const char *name,
                                         node_factory factory) {
   task_graph_node_kind_spec spec;
@@ -10340,8 +11457,15 @@ static const bool dummy_kinds_registered = [] {
   register_one_shot_test_kind("test_dummy_source", [](node_build_context &) {
     return std::unique_ptr<task_graph_node>(new dummy_source_node());
   });
+  register_one_shot_test_kind(
+      "test_ensemble_candidate", [](node_build_context &) {
+        return std::unique_ptr<task_graph_node>(new ensemble_candidate_node());
+      });
   register_one_shot_test_kind("test_dummy_sink", [](node_build_context &) {
     return std::unique_ptr<task_graph_node>(new dummy_sink_node());
+  });
+  register_one_shot_test_kind("test_logical_only", [](node_build_context &) {
+    return std::unique_ptr<task_graph_node>(new logical_only_test_node());
   });
   register_one_shot_test_kind(
       "test_unregistered_source", [](node_build_context &) {
@@ -10390,6 +11514,25 @@ TEST(DecodingTaskGraph, RegisteredEdgeValueTypeWiresAndRuns) {
   EXPECT_EQ(graph->run(m).bits[0], 0);
 }
 
+TEST(DecodingTaskGraph, OneShotSkipsLogicalOnlyNode) {
+  ASSERT_TRUE(dummy_kinds_registered);
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(decoderless_node("src", "test_dummy_source"));
+  nodes.push_back(decoderless_node("sink", "test_dummy_sink"));
+  nodes.push_back(decoderless_node("logical", "test_logical_only"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes), { {"measurements", "output", "src", "input"},
+                          {"src", "output", "sink", "input"},
+                          {"sink", "output", "output", "corrections"},
+                          {"measurements", "output", "logical", "input"},
+                          {"logical", "output", "output", "logical"} });
+  measurement_results m;
+  m.bits = {1, 0, 0};
+  const auto result = graph->run(m);
+  ASSERT_EQ(result.bits.size(), 1u);
+  EXPECT_EQ(result.bits[0], 1);
+}
+
 TEST(DecodingTaskGraph, RegisteredEdgeValueTypeFlowsOnAStreamingEdge) {
   ASSERT_TRUE(dummy_kinds_registered);
   std::vector<task_graph_node_config> nodes;
@@ -10426,6 +11569,23 @@ TEST(DecodingTaskGraph, EdgeValueRegistryRejectsBadNames) {
       detail::edge_value_registration(
           "test_dummy_value", std::in_place_type<test_unregistered_value>),
       std::invalid_argument);
+}
+
+TEST(DecodingTaskGraph, EdgeValueRegistrationSharedOwnerKeepsName) {
+  struct payload {
+    int value = 0;
+  };
+  const std::string name = "test_edge_value_shared_owner";
+  {
+    detail::edge_value_registration first(name, std::in_place_type<payload>);
+    {
+      detail::edge_value_registration second(name,
+                                             std::in_place_type<payload>);
+    }
+    EXPECT_EQ(edge_value_type(name), edge_value_type::of<payload>());
+    EXPECT_EQ(edge_value{payload{42}}.get<payload>().value, 42);
+  }
+  EXPECT_THROW((void)edge_value_type(name), std::invalid_argument);
 }
 
 TEST(DecodingTaskGraph, EdgeValueAliasesNameOneTypeAndWireTogether) {
@@ -10563,6 +11723,56 @@ TEST(DecodingTaskGraph, UnregisteredEdgeValueTypeIsRefusedAtBuild) {
                std::invalid_argument);
   EXPECT_THROW((void)edge_value_type("test_unregistered_value"),
                std::invalid_argument);
+}
+
+TEST(DecodingTaskGraph, EdgeValueTemplatedMoveAssignsWindowRowsInPlace) {
+  edge_value destination{window_rows{}};
+  ASSERT_EQ(destination.type(), edge_value_type::of<window_rows>());
+
+  window_rows replacement;
+  replacement.k = 4;
+  replacement.first_row = 7;
+  replacement.detectors = {1, 0, 1};
+  destination = std::move(replacement);
+
+  ASSERT_EQ(destination.type(), edge_value_type::of<window_rows>());
+  const auto &assigned = destination.get<window_rows>();
+  EXPECT_EQ(assigned.k, 4);
+  EXPECT_EQ(assigned.first_row, 7);
+  EXPECT_EQ(assigned.detectors, (std::vector<uint8_t>{1, 0, 1}));
+}
+
+TEST(DecodingTaskGraph, EdgeValueMoveAssignsWindowPayloadsInPlace) {
+  window_rows rows;
+  rows.k = 4;
+  rows.first_row = 7;
+  rows.detectors = {1, 0, 1};
+  edge_value rows_destination{window_rows{}};
+  edge_value rows_source{std::move(rows)};
+  ASSERT_EQ(rows_destination.type(), edge_value_type::of<window_rows>());
+  ASSERT_EQ(rows_source.type(), edge_value_type::of<window_rows>());
+
+  rows_destination = std::move(rows_source);
+  const auto &moved_rows = rows_destination.get<window_rows>();
+  EXPECT_EQ(moved_rows.k, 4);
+  EXPECT_EQ(moved_rows.first_row, 7);
+  EXPECT_EQ(moved_rows.detectors, (std::vector<uint8_t>{1, 0, 1}));
+  EXPECT_EQ(rows_source.type(), edge_value_type::of<window_rows>());
+
+  window_send_payload send;
+  send.values = {0, 1, 0};
+  send.first_row = 12;
+  edge_value send_destination{window_send_payload{}};
+  edge_value send_source{std::move(send)};
+  ASSERT_EQ(send_destination.type(),
+            edge_value_type::of<window_send_payload>());
+  ASSERT_EQ(send_source.type(), edge_value_type::of<window_send_payload>());
+
+  send_destination = std::move(send_source);
+  const auto &moved_send = send_destination.get<window_send_payload>();
+  EXPECT_EQ(moved_send.values, (std::vector<uint8_t>{0, 1, 0}));
+  EXPECT_EQ(moved_send.first_row, 12);
+  EXPECT_EQ(send_source.type(), edge_value_type::of<window_send_payload>());
 }
 
 TEST(DecodingTaskGraph, EdgeValueAssignsInPlaceWhenTypesMatch) {
@@ -11125,6 +12335,21 @@ TEST(DecodingTaskGraph, AsyncStreamingCopiesInputAndAppliesBackpressure) {
   EXPECT_EQ(probe->syndromes(),
             (std::vector<std::vector<float_t>>{{0}, {1}, {0}}));
 } // end - AsyncStreamingCopiesInputAndAppliesBackpressure
+
+TEST(DecodingTaskGraph, AsyncStreamingOversizedPayloadReleasesProducer) {
+  auto probe = std::make_shared<async_stream_probe>();
+  auto graph = make_async_stream_probe_graph(
+      probe, {.async_streaming = true, .async_queue_capacity = 1});
+  const uint8_t syndrome = 0;
+
+  EXPECT_THROW(graph->enqueue_syndrome(
+                   &syndrome, std::numeric_limits<std::size_t>::max()),
+               std::length_error);
+  EXPECT_TRUE(graph->enqueue_syndrome(&syndrome, 1, round_type::FINAL));
+  EXPECT_EQ(graph->streaming_result().status,
+            task_graph_streaming_status::complete);
+  EXPECT_EQ(probe->syndromes(), (std::vector<std::vector<float_t>>{{0}}));
+} // end - AsyncStreamingOversizedPayloadReleasesProducer
 
 TEST(DecodingTaskGraph, AsyncStreamingPinsItsCoordinatorWhenRequested) {
 #if !defined(__linux__)
@@ -12869,10 +14094,146 @@ public:
   std::vector<std::string> outputs() const override { return {"output"}; }
 };
 
+class batch_raw_outcome_node final : public task_graph_node {
+public:
+  std::optional<edge_value_type> output_type(std::size_t slot) const override {
+    return slot == 0 ? std::optional{edge_value_type("logical_outcome")}
+                     : std::nullopt;
+  }
+  bool accepts_input_type(std::size_t slot,
+                          edge_value_type type) const override {
+    return slot == 0 && type == edge_value_type("measurement_results");
+  }
+  std::optional<std::size_t>
+  output_value_size(std::size_t slot) const override {
+    return slot == 0 ? std::optional<std::size_t>{1} : std::nullopt;
+  }
+  void execute_indexed(const std::vector<edge_value> &,
+                       std::vector<edge_value> &outputs) const override {
+    outputs[0] = logical_outcome{{1}, true};
+  }
+  std::vector<std::string> inputs() const override { return {"input"}; }
+  std::vector<std::string> outputs() const override { return {"output"}; }
+};
+
+class completion_sink_node final : public task_graph_node,
+                                   public streaming_task_graph_node {
+public:
+  completion_sink_node() : output_(logical_outcome{{0}, true}) {}
+
+  streaming_task_graph_node *streaming() override { return this; }
+  bool enqueue(const uint8_t *, std::size_t, round_type) override {
+    return false;
+  }
+  bool enqueue_edge_value(const edge_value &value, std::size_t slot) override {
+    if (slot != 0 || value.type() != edge_value_type("completion"))
+      return false;
+    ++correction_;
+    valid_ = true;
+    return true;
+  }
+  const uint8_t *corrections() const override { return &correction_; }
+  void clear_corrections() override { correction_ = 0; }
+  void reset_streaming_state() override {
+    correction_ = 0;
+    valid_ = false;
+  }
+  std::size_t num_msyn_per_decode() const override { return 0; }
+  std::size_t num_msyn_per_round() const override { return 1; }
+  std::size_t num_observables() const override { return 1; }
+  bool supports_streaming_input(std::size_t slot) const override {
+    return slot == 0;
+  }
+  std::optional<window_spec> derive_streaming_schedule(
+      std::size_t output_slot,
+      const std::vector<input_schedule> &inputs) const override {
+    if (output_slot != 0 || inputs.size() != 1 || inputs[0].slot != 0)
+      return std::nullopt;
+    return inputs[0].schedule;
+  }
+  std::optional<edge_value_type> output_type(std::size_t slot) const override {
+    return slot == 0 ? std::optional{edge_value_type("logical_outcome")}
+                     : std::nullopt;
+  }
+  std::optional<std::size_t>
+  output_value_size(std::size_t slot) const override {
+    return slot == 0 ? std::optional<std::size_t>{1} : std::nullopt;
+  }
+  bool accepts_input_type(std::size_t slot,
+                          edge_value_type type) const override {
+    return slot == 0 && type == edge_value_type("completion");
+  }
+  const edge_value *streaming_output(std::size_t slot) const override {
+    return slot == 0 && valid_ ? &output_ : nullptr;
+  }
+  void execute_indexed(const std::vector<edge_value> &,
+                       std::vector<edge_value> &outputs) const override {
+    outputs[0] = logical_outcome{{0}, true};
+  }
+  std::vector<std::string> inputs() const override { return {"input"}; }
+  std::vector<std::string> outputs() const override { return {"output"}; }
+
+private:
+  edge_value output_;
+  uint8_t correction_ = 0;
+  bool valid_ = false;
+};
+
+static const bool batch_raw_outcome_registered = [] {
+  register_one_shot_test_kind("test_batch_raw_outcome", [](node_build_context &) {
+    return std::make_unique<batch_raw_outcome_node>();
+  });
+  return true;
+}();
+
+static const bool completion_sink_registered = [] {
+  task_graph_node_kind_spec spec;
+  spec.name = "test_completion_sink";
+  spec.requires_decoder = false;
+  spec.requires_dem = false;
+  register_node_kind(std::move(spec), {}, [](node_build_context &) {
+    return std::make_unique<completion_sink_node>();
+  });
+  return true;
+}();
+
+TEST(DecodingTaskGraph, WindowNodeDoneOutputUsesConfiguredSchedule) {
+  ASSERT_TRUE(completion_sink_registered);
+
+  task_graph_node_config window;
+  window.id = "window";
+  window.kind = "single_window";
+  window.dem = rep5_spec(5);
+  window.decoder_type = "single_error_lut";
+
+  task_graph_node_config completion;
+  completion.id = "completion";
+  completion.kind = "test_completion_sink";
+
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(window));
+  nodes.push_back(std::move(completion));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "window", "input"},
+       {"window", "done", "completion", "input"},
+       {"completion", "output", "output", "input"}});
+
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+  measurement_results shot;
+  shot.bits.assign(graph->get_num_msyn_per_decode(), 0);
+  const auto result = graph->run(shot);
+  EXPECT_TRUE(result.converged);
+  EXPECT_EQ(result.bits, (std::vector<uint8_t>{0}));
+}
+
 TEST(DecodingTaskGraph, BatchOnlyNodeExposesNoOptionalCapabilities) {
   batch_constant_node node;
   EXPECT_EQ(node.streaming(), nullptr);
   EXPECT_EQ(node.decoder_backed(), nullptr);
+  const task_graph_node &const_node = node;
+  EXPECT_EQ(const_node.decoder_backed(), nullptr);
 }
 
 static const bool batch_constant_registered = [] {
@@ -13855,6 +15216,13 @@ public:
     release_.notify_all();
   }
 
+  void throw_nonstandard_from_edge(bool enabled) {
+    throw_nonstandard_from_edge_.store(enabled, std::memory_order_release);
+  }
+  bool should_throw_nonstandard_from_edge() const {
+    return throw_nonstandard_from_edge_.load(std::memory_order_acquire);
+  }
+
   std::size_t count(const std::string &node) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return count_locked(node);
@@ -13926,6 +15294,7 @@ private:
   std::vector<std::pair<uint8_t, uint8_t>> pairs_;
   std::atomic<std::size_t> pool_in_flight_{0};
   std::atomic<std::size_t> pool_high_water_{0};
+  std::atomic<bool> throw_nonstandard_from_edge_{false};
   std::string blocked_node_;
   std::string failing_reset_;
   std::function<void()> reset_hook_;
@@ -13974,14 +15343,18 @@ public:
   bool enqueue_edge_value(const edge_value &value, std::size_t slot) override {
     const uint8_t bit = value.get<logical_outcome>().bits[0];
     probe_->log(id_ + ".value", bit);
+    if (mode_ == "pass" && probe_->should_throw_nonstandard_from_edge())
+      throw 1;
     if (mode_ == "skip" && (skipped_++ % 2) == 0)
       return false; // publishes on every other record only
     if (joins()) {
       // Each input's arrival, logged apart from the node's fires.
       probe_->log(id_ + "." + inputs()[slot], records_);
       pending_[slot] = bit;
-      if (++received_ < 2)
+      if (++received_ < 2) {
+        probe_->maybe_block(id_, records_);
         return false;
+      }
       received_ = 0;
       probe_->record_pair(pending_[0], pending_[1]);
       value_out_.get<logical_outcome>().bits[0] = pending_[0] ^ pending_[1];
@@ -14008,7 +15381,9 @@ public:
   const uint8_t *corrections() const override { return &correction_; }
   void clear_corrections() override { correction_ = 0; }
   // Whether the node takes raw measurements: `source`, or `wide`.
-  bool raw() const { return mode_ == "source" || mode_ == "wide"; }
+  bool raw() const {
+    return mode_ == "source" || mode_ == "wide" || mode_ == "uncapped";
+  }
   void reset_streaming_state() override {
     probe_->resetting();
     if (probe_->reset_fails(id_))
@@ -14132,6 +15507,125 @@ static task_graph_node_config pipeline_node(std::string id, std::string mode,
   return config;
 }
 
+TEST(DecodingTaskGraph, BatchOnlyOutputHasNoStreamingContributor) {
+  ASSERT_TRUE(batch_raw_outcome_registered && detector_source_registered);
+  task_graph_node_config batch;
+  batch.id = "batch";
+  batch.kind = "test_batch_raw_outcome";
+
+  task_graph_node_config source;
+  source.id = "source";
+  source.kind = "test_detector_source";
+  source.dem = arbitrary_memory_spec(5);
+  source.node_params = {{"window_size", std::size_t{5}},
+                        {"step_size", std::size_t{3}},
+                        {"start_guard", std::size_t{1}},
+                        {"end_guard", std::size_t{1}}};
+
+  task_graph_node_config window;
+  window.id = "window";
+  window.kind = "sliding_window";
+  window.dem = arbitrary_memory_spec(5);
+  window.decoder_type = "single_error_lut";
+  window.node_params = {{"window_size", std::size_t{5}},
+                        {"step_size", std::size_t{3}},
+                        {"start_guard", std::size_t{1}},
+                        {"end_guard", std::size_t{1}},
+                        {"arbitrary_length", true}};
+
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(batch));
+  nodes.push_back(std::move(source));
+  nodes.push_back(std::move(window));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "batch", "input"},
+       {"measurements", "output", "source", "input"},
+       {"source", "output", "window", "input"},
+       {"batch", "output", "output", "batch"},
+       {"window", "output", "output", "stream"}});
+
+  measurement_results shot;
+  shot.bits.assign(graph->get_num_msyn_per_decode(), 0);
+  const auto outcomes = graph->run_all(shot);
+  ASSERT_EQ(graph->output_names(),
+            (std::vector<std::string>{"batch", "stream"}));
+  ASSERT_EQ(outcomes.size(), 2u);
+  EXPECT_EQ(outcomes[0].bits, (std::vector<uint8_t>{1}));
+  expect_batch_valid_streaming_conflict(
+      std::move(graph), "output 'batch' is fed by no streaming node");
+}
+
+TEST(DecodingTaskGraph, StreamingEdgeIntoUnsupportedInputIsRejected) {
+  ASSERT_TRUE(detector_source_registered);
+  task_graph_node_config source;
+  source.id = "source";
+  source.kind = "test_detector_source";
+  source.dem = arbitrary_memory_spec(5);
+  source.node_params = {{"window_size", std::size_t{5}},
+                        {"step_size", std::size_t{3}},
+                        {"start_guard", std::size_t{1}},
+                        {"end_guard", std::size_t{1}}};
+
+  task_graph_node_config window;
+  window.id = "window";
+  window.kind = "sliding_window";
+  window.dem = arbitrary_memory_spec(5);
+  window.decoder_type = "single_error_lut";
+  window.node_params = {{"window_size", std::size_t{5}},
+                        {"step_size", std::size_t{3}},
+                        {"start_guard", std::size_t{1}},
+                        {"end_guard", std::size_t{1}},
+                        {"arbitrary_length", true}};
+
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(source));
+  nodes.push_back(std::move(window));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "source", "input"},
+       {"source", "output", "window", "input"},
+       {"window", "output", "output", "input"}});
+  expect_batch_valid_streaming_conflict(
+      std::move(graph), "has no streaming input on slot 'input'");
+}
+
+TEST(DecodingTaskGraph, DoneOutputRequiresMatchingInputSchedules) {
+  ASSERT_TRUE(pipeline_probe_registered && completion_sink_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+
+  const auto scheduled_window = [](std::string id, std::size_t step_size) {
+    task_graph_node_config node;
+    node.id = std::move(id);
+    node.kind = "sliding_window";
+    node.dem = rep5_streaming_spec();
+    node.decoder_type = "single_error_lut";
+    node.node_params = {{"window_size", std::size_t{3}},
+                        {"step_size", step_size}};
+    return node;
+  };
+  task_graph_node_config completion_sink;
+  completion_sink.id = "completion";
+  completion_sink.kind = "test_completion_sink";
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(scheduled_window("fast", 1));
+  nodes.push_back(scheduled_window("slow", 2));
+  nodes.push_back(pipeline_node("join", "join"));
+  nodes.push_back(std::move(completion_sink));
+
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "fast", "input"},
+       {"measurements", "output", "slow", "input"},
+       {"fast", "output", "join", "a"},
+       {"slow", "output", "join", "b"},
+       {"join", "done", "completion", "input"},
+       {"completion", "output", "output", "input"}});
+  expect_batch_valid_streaming_conflict(std::move(graph),
+                                        "different streaming schedules");
+}
+
 // measurements -> A -> {P, C} -> D, where P is a relay run as a fire pool of
 // `slots` copies and C inverts. D sees (v, v ^ 1) for every record, so a
 // pooled fire delivered to the wrong record shows up as an inconsistent pair.
@@ -14196,6 +15690,195 @@ static std::vector<uint8_t> pipeline_records(std::size_t count) {
   return records;
 }
 
+TEST(DecodingTaskGraph, AsyncNonStandardWorkerFailureResetCancelsFailedSession) {
+  ASSERT_TRUE(pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  std::vector<task_graph_node_config> nodes;
+  active_pipeline_probe = probe;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(pipeline_node("P", "pass"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "P", "input"},
+       {"P", "output", "output", "input"}},
+      {.async_streaming = true});
+
+  const uint8_t bulk = 0;
+  probe->throw_nonstandard_from_edge(true);
+  EXPECT_FALSE(graph->enqueue_syndrome(&bulk, 1, round_type::BULK));
+  ASSERT_TRUE(probe->wait_for_count("P.value", 1));
+  const auto failed = wait_for_streaming_result(
+      *graph, [](const task_graph_streaming_result &result) {
+        return result.status == task_graph_streaming_status::failed;
+      });
+  EXPECT_EQ(failed.status, task_graph_streaming_status::failed);
+  EXPECT_EQ(failed.error, "unknown asynchronous streaming failure");
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  graph->reset_decoder();
+  const auto reset = graph->streaming_result();
+  EXPECT_EQ(reset.status, task_graph_streaming_status::pending);
+  EXPECT_TRUE(reset.error.empty());
+  EXPECT_EQ(reset.shot_epoch, failed.shot_epoch + 1);
+
+  probe->throw_nonstandard_from_edge(false);
+  const uint8_t final = 1;
+  EXPECT_TRUE(graph->enqueue_syndrome(&final, 1, round_type::FINAL));
+  const auto completed = graph->streaming_result();
+  EXPECT_EQ(completed.status, task_graph_streaming_status::complete)
+      << completed.error;
+  ASSERT_EQ(completed.values.size(), 1u);
+  EXPECT_EQ(completed.values[0], 1u);
+}
+
+TEST(DecodingTaskGraph, AsyncResultReaderWaitsForProducerPublication) {
+  ASSERT_TRUE(pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "uncapped"));
+  nodes.push_back(pipeline_node("P", "pass"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "P", "input"},
+       {"P", "output", "output", "input"}},
+      {.async_streaming = true, .async_queue_capacity = 2});
+
+  std::vector<uint8_t> payload(16u * 1024u * 1024u, 0);
+  payload[0] = 1;
+  std::promise<void> producer_started;
+  auto started = producer_started.get_future();
+  auto producer = std::async(std::launch::async, [&] {
+    producer_started.set_value();
+    return graph->enqueue_syndrome(payload.data(), payload.size(),
+                                   round_type::BULK);
+  });
+  ASSERT_EQ(started.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (producer.wait_for(std::chrono::milliseconds(0)) !=
+             std::future_status::ready &&
+         std::chrono::steady_clock::now() < deadline)
+    (void)graph->streaming_result();
+
+  ASSERT_EQ(producer.wait_for(std::chrono::milliseconds(0)),
+            std::future_status::ready);
+  EXPECT_FALSE(producer.get());
+
+  const uint8_t final_record = 0;
+  EXPECT_TRUE(
+      graph->enqueue_syndrome(&final_record, 1, round_type::FINAL));
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete)
+      << result.error;
+  ASSERT_EQ(result.values.size(), 1u);
+  EXPECT_EQ(result.values[0], 1u);
+  EXPECT_GE(probe->count("A"), 1u);
+}
+
+TEST(DecodingTaskGraph,
+     AsyncWorkerFailureWaitsForConcurrentProducerPublication) {
+  ASSERT_TRUE(pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(pipeline_node("P", "pass"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "P", "input"},
+       {"P", "output", "output", "input"}},
+      {.async_streaming = true, .async_queue_capacity = 2});
+
+  probe->block_on("A", 0);
+  struct release_blocked_probe {
+    std::shared_ptr<pipeline_probe> probe;
+    ~release_blocked_probe() { probe->release(); }
+  } release_on_exit{probe};
+  probe->throw_nonstandard_from_edge(true);
+
+  const uint8_t first_record = 0;
+  EXPECT_FALSE(graph->enqueue_syndrome(&first_record, 1));
+  ASSERT_TRUE(probe->wait_until_blocking());
+
+  std::vector<uint8_t> large_record(64u * 1024u * 1024u, 0);
+  std::mutex producer_mutex;
+  std::condition_variable producer_changed;
+  bool producer_starting = false;
+  bool producer_accepted = true;
+  std::thread producer([&] {
+    {
+      std::lock_guard<std::mutex> lock(producer_mutex);
+      producer_starting = true;
+    }
+    producer_changed.notify_one();
+    producer_accepted =
+        graph->enqueue_syndrome(large_record.data(), large_record.size());
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(producer_mutex);
+    if (!producer_changed.wait_for(lock, std::chrono::seconds(2),
+                                   [&] { return producer_starting; })) {
+      probe->release();
+      producer.join();
+      FAIL() << "producer did not start its enqueue";
+    }
+  }
+  std::this_thread::yield();
+  probe->release();
+  producer.join();
+  EXPECT_FALSE(producer_accepted);
+
+  const auto failed = wait_for_streaming_result(
+      *graph, [](const task_graph_streaming_result &result) {
+        return result.status == task_graph_streaming_status::failed;
+      });
+  EXPECT_EQ(failed.status, task_graph_streaming_status::failed);
+  EXPECT_EQ(failed.error, "unknown asynchronous streaming failure");
+
+  graph->reset_decoder();
+  const auto reset = graph->streaming_result();
+  EXPECT_EQ(reset.status, task_graph_streaming_status::pending);
+  EXPECT_TRUE(reset.error.empty());
+}
+
+TEST(DecodingTaskGraph, ProcessStreamingRecordUnknownFailure) {
+  ASSERT_TRUE(pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(pipeline_node("P", "pass"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "P", "input"},
+       {"P", "output", "output", "input"}},
+      {.async_streaming = false});
+
+  const uint8_t record = 1;
+  probe->throw_nonstandard_from_edge(true);
+  EXPECT_THROW(graph->enqueue_syndrome(&record, 1), int);
+  const auto failed = graph->streaming_result();
+  EXPECT_EQ(failed.status, task_graph_streaming_status::failed);
+  EXPECT_EQ(failed.error, "unknown streaming failure");
+  EXPECT_FALSE(failed.operation_completed);
+
+  probe->throw_nonstandard_from_edge(false);
+  graph->reset_decoder();
+  EXPECT_TRUE(graph->enqueue_syndrome(&record, 1, round_type::FINAL));
+  const auto completed = graph->streaming_result();
+  EXPECT_EQ(completed.status, task_graph_streaming_status::complete)
+      << completed.error;
+  EXPECT_TRUE(completed.operation_completed);
+}
+
 TEST(DecodingTaskGraph, ConcurrentRecordsPipelineUpstreamNodes) {
   if (std::thread::hardware_concurrency() < 3)
     GTEST_SKIP() << "pipelining needs at least three CPU threads";
@@ -14229,6 +15912,55 @@ TEST(DecodingTaskGraph, ConcurrentRecordsPipelineUpstreamNodes) {
   expect_consistent_pairs(probe->pairs(), all);
   // Every record flips D's bit, so five records leave it set.
   EXPECT_EQ(result.values[0], 1u);
+}
+
+TEST(DecodingTaskGraph, RootOverlapAndPooledJoinLeaseAdmission) {
+  ASSERT_TRUE(pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(pipeline_node("B", "pass"));
+  nodes.push_back(pipeline_node("C", "pass"));
+  nodes.push_back(pipeline_node("P", "rendezvous", 0, -1, 2));
+  nodes.push_back(pipeline_node("D", "source"));
+  nodes.push_back(pipeline_node("Q", "pass"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "B", "input"},
+       {"A", "output", "C", "input"},
+       {"B", "output", "P", "a"},
+       {"C", "output", "P", "b"},
+       {"P", "output", "output", "joined"},
+       {"measurements", "output", "D", "input"},
+       {"D", "output", "Q", "input"},
+       {"Q", "output", "output", "independent"}},
+      {.async_streaming = true,
+       .async_queue_capacity = 8,
+       .async_num_workers = 4});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const uint8_t one = 1;
+  probe->block_on("P", 0);
+  auto enqueue = std::async(std::launch::async, [&] {
+    return graph->enqueue_syndrome(&one, 1, round_type::FINAL);
+  });
+  ASSERT_TRUE(probe->wait_until_blocking());
+  ASSERT_TRUE(probe->wait_for_count("B", 1));
+  ASSERT_TRUE(probe->wait_for_count("C", 1));
+  ASSERT_TRUE(probe->wait_for_count("Q", 1));
+  EXPECT_EQ(probe->count("P.a") + probe->count("P.b"), 1u);
+
+  probe->release();
+  EXPECT_TRUE(enqueue.get());
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete)
+      << result.error;
+  EXPECT_EQ(result.generation, 1u);
+  EXPECT_EQ(probe->pairs(),
+            (std::vector<std::pair<uint8_t, uint8_t>>{{1, 1}}));
 }
 
 // Rounds queued while the graph is behind are admitted together: with B
@@ -14736,6 +16468,59 @@ TEST(DecodingTaskGraph, SkippedRecordDoesNotHandNodeOnEarly) {
     EXPECT_EQ(seen[i], i) << "X ran records out of order";
 }
 
+TEST(DecodingTaskGraph, AsyncPooledJoinResetsLeaseAfterSkippedProducer) {
+  ASSERT_TRUE(pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(pipeline_node("P", "pass"));
+  nodes.push_back(pipeline_node("S", "skip"));
+  nodes.push_back(pipeline_node("D", "join", /*hold_ms=*/0,
+                                /*hold_bit=*/-1, /*max_in_flight=*/2));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "P", "input"},
+       {"A", "output", "S", "input"},
+       {"P", "output", "D", "a"},
+       {"S", "output", "D", "b"},
+       {"D", "output", "output", "joined"}},
+      {.async_streaming = true,
+       .async_queue_capacity = 16,
+       .async_num_workers = 2});
+  constexpr std::size_t count = 40;
+  const auto records = pipeline_records(count);
+  std::atomic<bool> done{false};
+  struct joiner {
+    std::thread t;
+    ~joiner() { t.join(); }
+  } watchdog{std::thread([&] {
+    for (int i = 0; i < 2000 && !done.load(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!done.load())
+      graph->reset_decoder();
+  })};
+  bool fired = false;
+  try {
+    for (std::size_t i = 0; i + 1 < count; ++i)
+      graph->enqueue_syndrome(&records[i], 1);
+    fired = graph->enqueue_syndrome(&records.back(), 1, round_type::FINAL);
+  } catch (const std::exception &e) {
+    done = true;
+    FAIL() << e.what();
+  }
+  done = true;
+  EXPECT_TRUE(fired);
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete)
+      << result.error;
+  std::vector<std::pair<uint8_t, uint8_t>> expected_pairs;
+  for (std::size_t i = 1; i < count; i += 2)
+    expected_pairs.emplace_back(records[i], records[i]);
+  EXPECT_EQ(probe->pairs(), expected_pairs);
+}
+
 TEST(DecodingTaskGraph, ConcurrentRecordsBufferEdgeValuesPerRecord) {
   if (std::thread::hardware_concurrency() < 3)
     GTEST_SKIP() << "pipelining needs at least three CPU threads";
@@ -14958,10 +16743,12 @@ public:
   index_probe_node(std::string id, std::string mode, std::int64_t limit,
                    std::size_t hold_ms, int hold_bit, bool staged,
                    std::shared_ptr<pipeline_probe> probe,
-                   std::int64_t first = 0, std::int64_t guaranteed = -1)
+                   std::int64_t first = 0, std::int64_t guaranteed = -1,
+                   bool repeat_coverage = false)
       : id_(std::move(id)), mode_(std::move(mode)), limit_(limit),
         first_(first), guaranteed_(guaranteed), hold_(hold_ms),
-        hold_bit_(hold_bit), staged_(staged), probe_(std::move(probe)) {
+        hold_bit_(hold_bit), staged_(staged),
+        repeat_coverage_(repeat_coverage), probe_(std::move(probe)) {
     logical_outcome output;
     output.bits = {0};
     output.converged = true;
@@ -14971,9 +16758,12 @@ public:
 
   streaming_task_graph_node *streaming() override { return this; }
   indexed_join_node *indexed_join() override {
-    return joins() ? this : nullptr;
+    return joins() || mode_ == "raw_indexed" ? this : nullptr;
   }
-  bool joins() const { return mode_ == "join" || mode_ == "join_send"; }
+  bool joins() const {
+    return mode_ == "join" || mode_ == "join_send" ||
+           mode_ == "completion_only";
+  }
 
   // indexed_join_node
   bool requires_input(std::size_t slot) const override { return slot == 0; }
@@ -14982,6 +16772,14 @@ public:
   }
   bool fire(std::int64_t k,
             const std::vector<const edge_value *> &inputs) override {
+    if (mode_ == "raw_indexed") {
+      const uint8_t bit = inputs[0]->get<logical_outcome>().bits[0];
+      value_out_.get<logical_outcome>().bits[0] = bit;
+      correction_ ^= bit;
+      published_ = k;
+      valid_ = true;
+      return true;
+    }
     const int a = inputs[0]->get<logical_outcome>().bits[0];
     const int b = inputs[1] ? inputs[1]->get<logical_outcome>().bits[0] : -1;
     if (index_fire_hook)
@@ -14991,6 +16789,8 @@ public:
       index_fires.push_back({k, a, b});
     }
     probe_->log(id_, static_cast<std::size_t>(k));
+    if (mode_ == "completion_only")
+      return false;
     if (hold_) {
       probe_->pool_enter();
       std::this_thread::sleep_for(std::chrono::milliseconds(hold_));
@@ -15000,14 +16800,23 @@ public:
     value_out_.get<logical_outcome>().bits[0] = out;
     correction_ ^= out;
     published_ = k;
-    coverage_ = committed_coverage{static_cast<std::uint64_t>(k),
-                                   static_cast<std::uint64_t>(k) + 1};
+    const auto coverage_begin =
+        repeat_coverage_ ? 0 : static_cast<std::uint64_t>(k);
+    coverage_ = committed_coverage{coverage_begin, coverage_begin + 1};
     valid_ = true;
     return true;
   }
 
   // streaming_task_graph_node
-  bool enqueue(const uint8_t *, std::size_t, round_type) override {
+  bool enqueue(const uint8_t *msyn, std::size_t len, round_type) override {
+    if (mode_ == "raw_source") {
+      for (std::size_t i = 0; i < len; ++i) {
+        value_out_.get<logical_outcome>().bits[0] = msyn[i];
+        published_ = static_cast<std::int64_t>(records_++);
+        valid_ = true;
+      }
+      return len != 0;
+    }
     return false;
   }
   bool enqueue_edge_value(const edge_value &value, std::size_t) override {
@@ -15027,6 +16836,33 @@ public:
       // reports one commit interval per record.
       correction_ ^= bit;
       value_out_.get<logical_outcome>().bits[0] = correction_;
+      const auto coverage_begin = static_cast<std::uint64_t>(
+          first_ + static_cast<std::int64_t>(records_));
+      coverage_ = committed_coverage{coverage_begin, coverage_begin + 1};
+      ++records_;
+      valid_ = true;
+      return true;
+    }
+    if (mode_ == "staged_zero") {
+      correction_ ^= bit;
+      value_out_.get<logical_outcome>().bits[0] = correction_;
+      coverage_ = records_ == 0
+                      ? committed_coverage{0, 0}
+                      : committed_coverage{records_ - 1, records_};
+      ++records_;
+      valid_ = true;
+      return true;
+    }
+    if (mode_ == "gap") {
+      correction_ ^= bit;
+      value_out_.get<logical_outcome>().bits[0] = correction_;
+      coverage_ = records_ == 0 ? committed_coverage{1, 2}
+                                : committed_coverage{0, 1};
+      ++records_;
+      valid_ = true;
+      return true;
+    }
+    if (mode_ == "empty_staged") {
       coverage_ = committed_coverage{records_, records_ + 1};
       ++records_;
       valid_ = true;
@@ -15088,9 +16924,11 @@ public:
   }
   bool exact_interval_coverage() const override { return staged_; }
   std::optional<committed_coverage> streaming_coverage() const override {
-    return staged_ ? coverage_ : std::nullopt;
+    return staged_ || mode_ == "running" ? coverage_ : std::nullopt;
   }
-  const uint8_t *corrections() const override { return &correction_; }
+  const uint8_t *corrections() const override {
+    return mode_ == "empty_staged" ? nullptr : &correction_;
+  }
   void clear_corrections() override { correction_ = 0; }
   void reset_streaming_state() override {
     correction_ = 0;
@@ -15102,13 +16940,28 @@ public:
     published_ = 0;
     coverage_.reset();
   }
-  std::size_t num_msyn_per_decode() const override { return 0; }
+  std::size_t num_msyn_per_decode() const override {
+    return mode_ == "raw_source" ? 1 : 0;
+  }
   std::size_t num_msyn_per_round() const override { return 1; }
   std::size_t num_observables() const override {
-    return joins() || mode_ == "logical" || mode_ == "running" ? 1 : 0;
+    return joins() || mode_ == "raw_indexed" || mode_ == "logical" ||
+                   mode_ == "running" || mode_ == "staged_zero" ||
+                   mode_ == "gap"
+               ? 1
+               : 0;
+  }
+  std::optional<std::size_t> raw_chunk_limit() const override {
+    return mode_ == "raw_source" ? std::optional<std::size_t>{1}
+                                 : std::nullopt;
+  }
+  bool supports_raw_streaming_input(std::size_t slot) const override {
+    return mode_ == "raw_source" && slot == 0;
   }
   bool supports_streaming_input(std::size_t slot) const override {
-    return slot < (joins() ? 2u : 1u);
+    return mode_ == "raw_indexed" ? slot == 0
+                                   : mode_ != "raw_source" &&
+                                         slot < (joins() ? 2u : 1u);
   }
   bool has_output(std::size_t slot) const {
     return slot == 0 ||
@@ -15117,6 +16970,9 @@ public:
   std::optional<window_spec> derive_streaming_schedule(
       std::size_t output_slot,
       const std::vector<input_schedule> &inputs) const override {
+    if (mode_ == "raw_source")
+      return streaming_task_graph_node::derive_streaming_schedule(output_slot,
+                                                                  inputs);
     if (!has_output(output_slot) || inputs.empty())
       return std::nullopt;
     return inputs[0].schedule;
@@ -15134,6 +16990,8 @@ public:
   }
   bool accepts_input_type(std::size_t slot,
                           edge_value_type type) const override {
+    if (mode_ == "raw_source")
+      return slot == 0 && type == edge_value_type("measurement_results");
     return supports_streaming_input(slot) &&
            (type == edge_value_type("logical_outcome") ||
             type == edge_value_type("measurement_results"));
@@ -15169,6 +17027,7 @@ private:
   std::size_t hold_;
   int hold_bit_;
   bool staged_;
+  bool repeat_coverage_;
   std::shared_ptr<pipeline_probe> probe_;
   uint8_t correction_ = 0;
   uint8_t parity_ = 0;
@@ -15197,6 +17056,8 @@ static const bool index_probe_registered = [] {
   schema.params.push_back({"first", param_kind::int32, /*required=*/false});
   schema.params.push_back(
       {"guaranteed", param_kind::int32, /*required=*/false});
+  schema.params.push_back(
+      {"repeat_coverage", param_kind::int32, /*required=*/false});
   register_node_kind(
       std::move(spec), std::move(schema), [](node_build_context &ctx) {
         return std::make_unique<index_probe_node>(
@@ -15206,7 +17067,8 @@ static const bool index_probe_registered = [] {
             ctx.node_params->get<int>("hold_bit", -1),
             ctx.node_params->get<int>("staged", 0) != 0, active_pipeline_probe,
             ctx.node_params->get<int>("first", 0),
-            ctx.node_params->get<int>("guaranteed", -1));
+            ctx.node_params->get<int>("guaranteed", -1),
+            ctx.node_params->get<int>("repeat_coverage", 0) != 0);
       });
   return true;
 }();
@@ -15214,7 +17076,8 @@ static const bool index_probe_registered = [] {
 static task_graph_node_config
 index_node(std::string id, std::string mode, int limit = 1 << 30,
            std::size_t hold_ms = 0, int hold_bit = -1,
-           std::size_t max_in_flight = 1, bool staged = false, int first = 0) {
+           std::size_t max_in_flight = 1, bool staged = false, int first = 0,
+           bool repeat_coverage = false) {
   task_graph_node_config config;
   config.id = std::move(id);
   config.kind = "test_index_probe";
@@ -15224,6 +17087,7 @@ index_node(std::string id, std::string mode, int limit = 1 << 30,
   config.node_params.insert("hold_ms", hold_ms);
   config.node_params.insert("hold_bit", hold_bit);
   config.node_params.insert("staged", staged ? 1 : 0);
+  config.node_params.insert("repeat_coverage", repeat_coverage ? 1 : 0);
   config.max_in_flight = max_in_flight;
   return config;
 }
@@ -15299,6 +17163,47 @@ static uint8_t expected_join_parity(const std::vector<uint8_t> &records,
   for (std::size_t k = 0; k < fires; ++k)
     parity ^= k == 0 ? records[0] : (records[k] ^ records[k - 1]);
   return parity;
+}
+
+TEST(DecodingTaskGraph, IndexedFirePublishesCompletionWithoutValue) {
+  ASSERT_TRUE(pipeline_probe_registered && index_probe_registered &&
+              completion_sink_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  {
+    std::lock_guard<std::mutex> lock(index_fires_mutex);
+    index_fires.clear();
+  }
+
+  task_graph_node_config completion_sink;
+  completion_sink.id = "completion";
+  completion_sink.kind = "test_completion_sink";
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("T", "tag"));
+  nodes.push_back(index_node("R", "tag"));
+  nodes.push_back(index_node("J", "completion_only"));
+  nodes.push_back(std::move(completion_sink));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "T", "input"},
+       {"A", "output", "R", "input"},
+       {"T", "output", "J", "a"},
+       {"R", "output", "J", "b", /*index_offset=*/-1},
+       {"J", "done", "completion", "input"},
+       {"completion", "output", "output", "input"}});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const uint8_t measurement = 1;
+  EXPECT_TRUE(
+      graph->enqueue_syndrome(&measurement, 1, round_type::FINAL));
+  expect_indexed_pairs({measurement}, 1);
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete);
+  ASSERT_EQ(result.values.size(), 1u);
+  EXPECT_EQ(result.values[0], 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -15416,6 +17321,30 @@ TEST(DecodingTaskGraph, FirePoolRejectsRawInput) {
   }
 }
 
+TEST(DecodingTaskGraph, StreamingDecoderNodeRejectsFirePool) {
+  task_graph_node_config node;
+  node.id = "native";
+  node.kind = "streaming";
+  node.dem = rep5_spec(5);
+  node.decoder_type = "single_error_lut";
+  node.max_in_flight = 2;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(std::move(node));
+
+  task_graph_options options;
+  options.async_streaming = true;
+  options.async_queue_capacity = 2;
+  try {
+    (void)decoding_task_graph::from_topology(std::move(nodes), {}, options);
+    FAIL() << "a streaming decoder fire pool was built";
+  } catch (const std::invalid_argument &e) {
+    EXPECT_NE(std::string(e.what()).find(
+                  "keeps state across deliveries and cannot run as a fire pool"),
+              std::string::npos)
+        << e.what();
+  }
+}
+
 TEST(DecodingTaskGraph, FirePoolRejectsStatefulKindsAndBuiltDecoders) {
   task_graph_node_config node;
   node.id = "w";
@@ -15429,6 +17358,26 @@ TEST(DecodingTaskGraph, FirePoolRejectsStatefulKindsAndBuiltDecoders) {
   nodes.push_back(std::move(node));
   EXPECT_THROW(decoding_task_graph::from_topology(std::move(nodes), {}, {}),
                std::invalid_argument);
+
+  task_graph_node_config predecoder;
+  predecoder.id = "pre";
+  predecoder.kind = "predecoder";
+  predecoder.dem = rep5_spec(5);
+  predecoder.decoder_type = "single_error_lut";
+  predecoder.node_params.insert("residual_from", std::string("parity_check"));
+  predecoder.max_in_flight = 2;
+  std::vector<task_graph_node_config> predecoder_nodes;
+  predecoder_nodes.push_back(std::move(predecoder));
+  try {
+    (void)decoding_task_graph::from_topology(
+        std::move(predecoder_nodes), {}, {.async_streaming = true});
+    FAIL() << "a predecoder fire pool was built";
+  } catch (const std::invalid_argument &e) {
+    EXPECT_NE(std::string(e.what()).find(
+                  "keeps state across deliveries and cannot run as a fire pool"),
+              std::string::npos)
+        << e.what();
+  }
 
   ASSERT_TRUE(pipeline_probe_registered);
   active_pipeline_probe = std::make_shared<pipeline_probe>();
@@ -15624,6 +17573,22 @@ TEST(DecodingTaskGraph, RendezvousKeepsEachRecordsInputsTogether) {
 // Indexed joins
 // ---------------------------------------------------------------------------
 
+TEST(DecodingTaskGraph, IndexedJoinDefaultsInputsToNotGuaranteed) {
+  class default_guarantee_join final : public indexed_join_node {
+  public:
+    bool requires_input(std::size_t) const override { return false; }
+    bool fire(std::int64_t,
+              const std::vector<const edge_value *> &) override {
+      return false;
+    }
+  } join;
+
+  const indexed_join_node &contract = join;
+  EXPECT_FALSE(contract.input_guaranteed(0, 0));
+  EXPECT_FALSE(contract.input_guaranteed(1, 0));
+  EXPECT_FALSE(contract.input_guaranteed(1, 7));
+}
+
 TEST(DecodingTaskGraph, IndexedJoinPairsInstancesAcrossRecords) {
   ASSERT_TRUE(index_probe_registered);
   for (const std::size_t copies : {1u, 2u}) {
@@ -15643,6 +17608,27 @@ TEST(DecodingTaskGraph, IndexedJoinPairsInstancesAcrossRecords) {
     EXPECT_EQ(result.values[0], expected_join_parity(records, records.size()))
         << "copies=" << copies;
   }
+}
+
+TEST(DecodingTaskGraph, RawIndexedChunkContinuationSnapshotsFinal) {
+  ASSERT_TRUE(index_probe_registered);
+  active_pipeline_probe = std::make_shared<pipeline_probe>();
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(index_node("raw", "raw_source"));
+  nodes.push_back(index_node("indexed", "raw_indexed"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "raw", "input"},
+       {"raw", "output", "indexed", "input"},
+       {"indexed", "output", "output", "input"}});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const std::array<uint8_t, 3> bits = {1, 1, 1};
+  graph->enqueue_syndrome(bits.data(), 2);
+  graph->enqueue_syndrome(&bits[2], 1, round_type::FINAL);
+
+  EXPECT_EQ(graph->get_obs_corrections()[0], 1u);
 }
 
 // An edge back to its own node, or to an earlier one, is loop-carried: it
@@ -15898,6 +17884,73 @@ TEST(DecodingTaskGraph, RepeatPublicationsNeedAnIndexedConsumer) {
       {});
   const uint8_t record = 1;
   EXPECT_THROW(graph->enqueue_syndrome(&record, 1), std::logic_error);
+}
+
+TEST(DecodingTaskGraph,
+     RecordOrderedSparsePublicationAnnouncesAbsenceAndOrdersBranches) {
+  ASSERT_TRUE(index_probe_registered && pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("S", "even"));
+  nodes.push_back(pipeline_node("P", "pass"));
+  nodes.push_back(pipeline_node("J", "join"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "S", "input"},
+       {"A", "output", "P", "input"},
+       {"S", "output", "J", "a"},
+       {"P", "output", "J", "b"},
+       {"J", "output", "output", "input"}});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const std::vector<uint8_t> records = {1, 0, 1, 1, 0, 1};
+  for (std::size_t record_index = 0; record_index + 1 < records.size();
+       ++record_index)
+    graph->enqueue_syndrome(&records[record_index], 1);
+  EXPECT_TRUE(graph->enqueue_syndrome(&records.back(), 1, round_type::FINAL));
+
+  EXPECT_EQ(graph->streaming_result().status,
+            task_graph_streaming_status::complete);
+  std::vector<std::pair<uint8_t, uint8_t>> expected_pairs;
+  for (const auto bit : records)
+    expected_pairs.emplace_back(bit, bit);
+  EXPECT_EQ(probe->pairs(), expected_pairs);
+}
+
+TEST(DecodingTaskGraph,
+     AsyncRecordOrderedDeliveryDropsUnpublishedCopiedWire) {
+  ASSERT_TRUE(index_probe_registered && pipeline_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(pipeline_node("P", "pass", 0, -1, /*max_in_flight=*/2));
+  nodes.push_back(index_node("S", "split"));
+  nodes.push_back(pipeline_node("X", "pass"));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "P", "input"},
+       {"P", "output", "S", "input"},
+       {"S", "odd", "X", "input"},
+       {"X", "output", "output", "input"}},
+      {.async_streaming = true, .async_queue_capacity = 2});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const std::array<uint8_t, 2> records = {0, 1};
+  (void)graph->enqueue_syndrome(&records[0], 1);
+  (void)graph->enqueue_syndrome(&records[1], 1, round_type::FINAL);
+
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete);
+  ASSERT_EQ(result.values.size(), 1u);
+  EXPECT_EQ(result.values[0], 1);
+  EXPECT_EQ(probe->records("X"), (std::vector<std::size_t>{0}));
 }
 
 TEST(DecodingTaskGraph, IndexedJoinMatchesSynchronousGraph) {
@@ -16164,6 +18217,60 @@ TEST(DecodingTaskGraph, IndexedJoinFiresEachInstanceOnce) {
   } // end - for(async)
 } // end - TEST(DecodingTaskGraph, IndexedJoinFiresEachInstanceOnce)
 
+TEST(DecodingTaskGraph, IndexedJoinDropsInstanceWithRequiredNegativeOffset) {
+  ASSERT_TRUE(index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  {
+    std::lock_guard<std::mutex> lock(index_fires_mutex);
+    index_fires.clear();
+  }
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("T", "tag"));
+  nodes.push_back(index_node("R", "tag"));
+  nodes.push_back(index_node("J", "join"));
+  task_graph_options options;
+  options.async_streaming = true;
+  options.async_num_workers = 2;
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "T", "input"},
+       {"A", "output", "R", "input"},
+       {"T", "output", "J", "a", /*index_offset=*/-1},
+       {"R", "output", "J", "b", /*index_offset=*/0},
+       {"J", "output", "output", "input"}},
+      options);
+  const auto records = pipeline_records(4);
+  for (std::size_t i = 0; i < records.size(); ++i)
+    graph->enqueue_syndrome(&records[i], 1,
+                            i + 1 == records.size() ? round_type::FINAL
+                                                    : round_type::BULK);
+
+  const auto &result = graph->streaming_result();
+  ASSERT_EQ(result.status, task_graph_streaming_status::complete)
+      << result.error;
+  std::lock_guard<std::mutex> lock(index_fires_mutex);
+  ASSERT_EQ(index_fires.size(), records.size());
+  std::vector<bool> fired(records.size() + 1, false);
+  for (const auto &fire : index_fires) {
+    ASSERT_GE(fire.k, 1);
+    ASSERT_LE(fire.k, static_cast<std::int64_t>(records.size()));
+    const auto k = static_cast<std::size_t>(fire.k);
+    EXPECT_FALSE(fired[k]) << "J[" << k << "] fired twice";
+    fired[k] = true;
+    EXPECT_EQ(fire.a, records[k - 1]) << "J[" << k << "]";
+    if (k < records.size())
+      EXPECT_EQ(fire.b, records[k]) << "J[" << k << "]";
+    else
+      EXPECT_EQ(fire.b, -1) << "J[" << k << "] has no R input";
+  }
+  EXPECT_FALSE(fired[0]);
+  for (std::size_t k = 1; k <= records.size(); ++k)
+    EXPECT_TRUE(fired[k]) << "J[" << k << "] did not fire";
+} // end - TEST(DecodingTaskGraph, IndexedJoinDropsInstanceWithRequiredNegativeOffset)
+
 TEST(DecodingTaskGraph, IndexedJoinHandlesManyInstancesPerRecord) {
   ASSERT_TRUE(index_probe_registered);
   auto probe = std::make_shared<pipeline_probe>();
@@ -16418,6 +18525,141 @@ TEST(DecodingTaskGraph, StagedOutputHoldsWholeShotUntilFinal) {
   EXPECT_EQ(graph->streaming_result().values[0], records[1]);
 }
 
+TEST(DecodingTaskGraph, StagedOutputInsertsEarlierGapInterval) {
+  ASSERT_TRUE(index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("N", "gap", 1 << 30, 0, -1, 1,
+                             /*staged=*/true));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "N", "input"},
+       {"N", "output", "output", "input"}});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const uint8_t first_record = 1;
+  const uint8_t second_record = 0;
+  graph->enqueue_syndrome(&first_record, 1);
+  const auto first_result = graph->streaming_result();
+  ASSERT_EQ(first_result.outputs.size(), 1u);
+  EXPECT_EQ(first_result.outputs[0].coverage_begin_round, 0u);
+  EXPECT_EQ(first_result.outputs[0].coverage_end_round, 0u);
+  EXPECT_EQ(first_result.values.at(0), 0);
+
+  graph->enqueue_syndrome(&second_record, 1);
+  const auto result = graph->streaming_result();
+  ASSERT_EQ(result.outputs.size(), 1u);
+  EXPECT_EQ(result.outputs[0].coverage_begin_round, 0u);
+  EXPECT_EQ(result.outputs[0].coverage_end_round, 2u);
+  EXPECT_EQ(result.values.at(0), 1);
+}
+
+TEST(DecodingTaskGraph, MoveAssignmentPreservesPendingStagedInterval) {
+  ASSERT_TRUE(index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  const auto build_graph = [&]() {
+    std::vector<task_graph_node_config> nodes;
+    nodes.push_back(pipeline_node("A", "source"));
+    nodes.push_back(index_node("N", "gap", 1 << 30, 0, -1, 1,
+                               /*staged=*/true));
+    return decoding_task_graph::from_topology(
+        std::move(nodes),
+        {{"measurements", "output", "A", "input"},
+         {"A", "output", "N", "input"},
+         {"N", "output", "output", "input"}});
+  };
+  auto graph = build_graph();
+  auto destination = build_graph();
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const uint8_t first_record = 1;
+  const uint8_t second_record = 0;
+  graph->enqueue_syndrome(&first_record, 1);
+  const auto first_result = graph->streaming_result();
+  ASSERT_EQ(first_result.outputs.size(), 1u);
+  EXPECT_EQ(first_result.outputs[0].coverage_end_round, 0u);
+  EXPECT_EQ(first_result.values.at(0), 0);
+
+  *destination = std::move(*graph);
+  destination->enqueue_syndrome(&second_record, 1);
+  const auto result = destination->streaming_result();
+  ASSERT_EQ(result.outputs.size(), 1u);
+  EXPECT_EQ(result.outputs[0].coverage_begin_round, 0u);
+  EXPECT_EQ(result.outputs[0].coverage_end_round, 2u);
+  EXPECT_EQ(result.values.at(0), 1);
+}
+
+TEST(DecodingTaskGraph, ScheduledOutputFallsBackOnMismatchedCoverageStarts) {
+  ASSERT_TRUE(pipeline_probe_registered && index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("L", "running", 1 << 30, 0, -1, 1, false, 0));
+  nodes.push_back(index_node("R", "running", 1 << 30, 0, -1, 1, false, 1));
+  task_graph_node_config combine;
+  combine.id = "X";
+  combine.kind = "xor";
+  nodes.push_back(std::move(combine));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "L", "input"},
+       {"A", "output", "R", "input"},
+       {"L", "output", "X", "a"},
+       {"R", "output", "X", "b"},
+       {"X", "output", "output", "input"}});
+
+  const uint8_t record = 1;
+  graph->enqueue_syndrome(&record, 1, round_type::BULK);
+  const auto result = graph->streaming_result();
+  ASSERT_EQ(result.outputs.size(), 1u);
+  EXPECT_EQ(result.outputs[0].status, task_graph_streaming_status::available);
+  EXPECT_EQ(result.outputs[0].coverage_begin_round, 1u);
+  EXPECT_EQ(result.outputs[0].coverage_end_round, 2u);
+  graph->reset_decoder();
+}
+
+TEST(DecodingTaskGraph, StagedOutputSingleRecordInitializesFrame) {
+  ASSERT_TRUE(index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(
+      index_node("N", "running", 1 << 30, 0, -1, 1, /*staged=*/true));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "N", "input"},
+       {"N", "output", "output", "input"}});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const auto initial_result = graph->streaming_result();
+  ASSERT_EQ(initial_result.outputs.size(), 1u);
+  EXPECT_EQ(initial_result.outputs[0].value_width, 1u);
+  EXPECT_EQ(initial_result.outputs[0].coverage_end_round, 0u);
+  ASSERT_EQ(initial_result.values.size(), 1u);
+  EXPECT_EQ(initial_result.values[0], 0);
+
+  const uint8_t record = 1;
+  EXPECT_TRUE(graph->enqueue_syndrome(&record, 1, round_type::FINAL));
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete);
+  ASSERT_EQ(result.outputs.size(), 1u);
+  EXPECT_EQ(result.outputs[0].coverage_begin_round, 0u);
+  EXPECT_EQ(result.outputs[0].coverage_end_round, 1u);
+  ASSERT_EQ(result.values.size(), 1u);
+  EXPECT_EQ(result.values[0], 1);
+}
+
 TEST(DecodingTaskGraph, StagedRecordOrderedNodePublishesDeltas) {
   ASSERT_TRUE(index_probe_registered);
   auto probe = std::make_shared<pipeline_probe>();
@@ -16445,6 +18687,157 @@ TEST(DecodingTaskGraph, StagedRecordOrderedNodePublishesDeltas) {
   EXPECT_EQ(result.status, task_graph_streaming_status::complete);
   EXPECT_EQ(result.outputs[0].coverage_end_round, records.size());
   EXPECT_EQ(result.values[0], 1); // the parity of the records
+}
+
+TEST(DecodingTaskGraph, StagedEmptyDeltaSnapshotsZeroObservables) {
+  ASSERT_TRUE(index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("N", "empty_staged", 1 << 30, 0, -1, 1,
+                             /*staged=*/true));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "N", "input"},
+       {"N", "output", "output", "input"}});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const std::vector<uint8_t> records = {1, 0, 1, 1};
+  for (std::size_t record_index = 0; record_index + 1 < records.size();
+       ++record_index)
+    graph->enqueue_syndrome(&records[record_index], 1);
+  EXPECT_TRUE(graph->enqueue_syndrome(&records.back(), 1, round_type::FINAL));
+
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete);
+  ASSERT_EQ(result.outputs.size(), 1u);
+  EXPECT_EQ(result.outputs[0].coverage_begin_round, 0u);
+  EXPECT_EQ(result.outputs[0].coverage_end_round, records.size());
+  EXPECT_EQ(result.outputs[0].value_width, 0u);
+  EXPECT_TRUE(result.values.empty());
+}
+
+TEST(DecodingTaskGraph, StagedZeroLengthCommitFoldsDelta) {
+  ASSERT_TRUE(index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("N", "staged_zero", 1 << 30, 0, -1, 1,
+                             /*staged=*/true));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "N", "input"},
+       {"N", "output", "output", "input"}});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const std::vector<uint8_t> records = {1, 1, 0};
+  for (std::size_t record_index = 0; record_index + 1 < records.size();
+       ++record_index)
+    graph->enqueue_syndrome(&records[record_index], 1);
+  EXPECT_TRUE(graph->enqueue_syndrome(&records.back(), 1, round_type::FINAL));
+
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete);
+  ASSERT_EQ(result.outputs.size(), 1u);
+  EXPECT_EQ(result.outputs[0].coverage_begin_round, 0u);
+  EXPECT_EQ(result.outputs[0].coverage_end_round, 2u);
+  ASSERT_EQ(result.values.size(), 1u);
+  EXPECT_EQ(result.values[0], 0);
+}
+
+TEST(DecodingTaskGraph, AsyncStreamingRetirementFailureStopsSession) {
+  ASSERT_TRUE(pipeline_probe_registered && index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("T", "tag"));
+  nodes.push_back(index_node("R", "tag"));
+  nodes.push_back(index_node("J", "join", 1 << 30, 0, -1, 1,
+                             /*staged=*/true, /*first=*/0,
+                             /*repeat_coverage=*/true));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "T", "input"},
+       {"A", "output", "R", "input"},
+       {"T", "output", "J", "a", /*index_offset=*/0},
+       {"R", "output", "J", "b", /*index_offset=*/0},
+       {"J", "output", "output", "input"}},
+      {.async_streaming = true, .async_queue_capacity = 1});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const uint8_t first_record = 0;
+  EXPECT_FALSE(graph->enqueue_syndrome(&first_record, 1));
+  const auto first_commit = wait_for_streaming_result(
+      *graph, [](const task_graph_streaming_result &result) {
+        return !result.outputs.empty() && result.outputs[0].generation >= 1;
+      });
+  ASSERT_FALSE(first_commit.outputs.empty());
+  EXPECT_EQ(first_commit.outputs[0].generation, 1u);
+  EXPECT_EQ(first_commit.outputs[0].coverage_end_round, 1u);
+
+  const uint8_t second_record = 1;
+  EXPECT_FALSE(graph->enqueue_syndrome(&second_record, 1));
+  const auto failed = wait_for_streaming_result(
+      *graph, [](const task_graph_streaming_result &result) {
+        return result.status == task_graph_streaming_status::failed;
+      });
+  EXPECT_EQ(failed.status, task_graph_streaming_status::failed);
+  EXPECT_NE(failed.error.find(
+                "commit interval starting at round 0, behind its frontier 1"),
+            std::string::npos)
+      << failed.error;
+}
+
+TEST(DecodingTaskGraph, AsyncFinalRejectsWholeShotWithPendingStagedIntervals) {
+  ASSERT_TRUE(pipeline_probe_registered && index_probe_registered);
+  auto probe = std::make_shared<pipeline_probe>();
+  active_pipeline_probe = probe;
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(pipeline_node("A", "source"));
+  nodes.push_back(index_node("N", "running", 1 << 30, 0, -1, 1,
+                             /*staged=*/true, /*first=*/1));
+  nodes.push_back(index_node("L", "logical", 1 << 30, 0, -1, 1,
+                             /*staged=*/true));
+  task_graph_node_config combine;
+  combine.id = "X";
+  combine.kind = "xor";
+  nodes.push_back(std::move(combine));
+  auto graph = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "A", "input"},
+       {"A", "output", "N", "input"},
+       {"A", "output", "L", "input"},
+       {"N", "output", "X", "a"},
+       {"L", "output", "X", "b"},
+       {"X", "output", "output", "input"}},
+      {.async_streaming = true, .async_queue_capacity = 2});
+  ASSERT_TRUE(graph->supports_streaming())
+      << graph->streaming_incompatibility_reason();
+
+  const uint8_t ordinary_record = 1;
+  EXPECT_FALSE(graph->enqueue_syndrome(&ordinary_record, 1));
+  const uint8_t final_record = 1;
+  EXPECT_THROW(
+      graph->enqueue_syndrome(&final_record, 1, round_type::FINAL),
+      std::logic_error);
+
+  const auto failed = wait_for_streaming_result(
+      *graph, [](const task_graph_streaming_result &result) {
+        return result.status == task_graph_streaming_status::failed;
+      });
+  EXPECT_EQ(failed.status, task_graph_streaming_status::failed);
+  EXPECT_NE(failed.error.find("uncommitted interval"), std::string::npos)
+      << failed.error;
+  EXPECT_NE(failed.error.find("FINAL"), std::string::npos) << failed.error;
 }
 
 TEST(DecodingTaskGraph, StagedOutputRejectsMixedContributors) {
@@ -16637,6 +19030,27 @@ TEST(ParallelWindowLowering, PassesTheOptionsOn) {
             0);
 } // end - TEST(ParallelWindowLowering, PassesTheOptionsOn)
 
+TEST(ParallelWindowLowering, AsyncPooledDecodeWindowSharesCore) {
+  lowered_pattern p(
+      arbitrary_memory_spec(5),
+      {{"commit_rounds", std::size_t{2}},
+       {"buffer_rounds", std::size_t{1}},
+       {"output", std::string("corrections")}},
+      /*max_in_flight=*/2);
+  auto graph = decoding_task_graph::from_topology(
+      std::move(p.nodes), std::move(p.edges), {.async_streaming = true});
+  ASSERT_TRUE(graph->supports_streaming());
+  const std::uint8_t zeros[4]{};
+  for (std::size_t round = 0; round < 3; ++round)
+    graph->enqueue_syndrome(
+        zeros, 4, round == 2 ? round_type::FINAL : round_type::BULK);
+  const auto result = graph->streaming_result();
+  EXPECT_EQ(result.status, task_graph_streaming_status::complete);
+  ASSERT_EQ(result.outputs.size(), 1u);
+  EXPECT_EQ(result.outputs[0].coverage_end_round, 3u);
+  EXPECT_EQ(result.values, (std::vector<std::uint8_t>{0}));
+}
+
 // Without boundary_prior, A's open input takes, over the detectors faults
 // cross into, the largest chance that an odd number of them fire: one
 // crossing fault's prior, or two combined as merged columns are, whatever
@@ -16793,6 +19207,63 @@ TEST(ParallelWindowLowering, RejectsAPatternInsideAnEnsemble) {
       "expands only as a node of the graph");
 } // end - TEST(ParallelWindowLowering, RejectsAPatternInsideAnEnsemble)
 
+TEST(DecodingTaskGraph, EnsembleSizingSkipsUnknownMemberWidths) {
+  ASSERT_TRUE(dummy_kinds_registered);
+  const auto build_ensemble = [](const char *member_kind,
+                                 std::vector<task_graph_edge> member_edges) {
+    task_graph_ensemble_spec::member member;
+    member.nodes.push_back(decoderless_node("member", member_kind));
+    member.edges = std::move(member_edges);
+
+    task_graph_ensemble_spec spec;
+    spec.members.push_back(std::move(member));
+    spec.join_strategy = "first";
+
+    task_graph_node_config ensemble;
+    ensemble.id = "E";
+    ensemble.kind = "ensemble";
+    ensemble.ensemble = std::move(spec);
+
+    std::vector<task_graph_node_config> nodes;
+    nodes.push_back(std::move(ensemble));
+    return decoding_task_graph::from_topology(
+        std::move(nodes), {{"measurements", "output", "E", "input"},
+                           {"E", "output", "output", "input"}});
+  };
+
+  expect_lowering_error(
+      [&] {
+        build_ensemble("test_dummy_source",
+                       {{"input", "output", "member", "input"},
+                        {"missing", "output", "output", "input"}});
+      },
+      "compile_wires: unknown node 'E.m0.missing'");
+  expect_lowering_error(
+      [&] {
+        build_ensemble("test_dummy_source",
+                       {{"input", "output", "member", "input"},
+                        {"member", "missing", "output", "input"}});
+      },
+      "compile_wires: node 'E.m0.member' has no output 'missing'");
+  expect_lowering_error(
+      [&] {
+        build_ensemble("test_dummy_source",
+                       {{"input", "output", "member", "input"},
+                        {"member", "output", "output", "input"}});
+      },
+      "compile_wires: edge type mismatch — node 'E.m0.push' input 'input' "
+      "does not accept what node 'E.m0.member' output 'output' produces");
+
+  auto graph = build_ensemble(
+      "test_ensemble_candidate",
+      {{"input", "output", "member", "input"}});
+  measurement_results measurements;
+  measurements.bits = {0};
+  const auto outcome = graph->run(measurements);
+  EXPECT_TRUE(outcome.converged);
+  EXPECT_EQ(outcome.bits, (std::vector<uint8_t>{1}));
+}
+
 // A pattern or an ensemble may not take a synthetic endpoint's id, though
 // lowering gives its nodes other ids.
 TEST(ParallelWindowLowering, RejectsAReservedId) {
@@ -16874,6 +19345,8 @@ TEST(WindowKinds, BuildTheirNodesFromTheContext) {
   auto readout = build("logical_readout", readout_ctx);
   ASSERT_NE(dynamic_cast<logical_readout_node *>(readout.get()), nullptr);
   EXPECT_EQ(readout->outputs(), std::vector<std::string>{"output"});
+  EXPECT_EQ(readout->output_value_size(0), std::optional<std::size_t>{1});
+  EXPECT_FALSE(readout->output_value_size(1).has_value());
   // A's first window, copied while its publication stands.
   for (std::size_t at = 0; !window; at += *in->raw_chunk_limit()) {
     ASSERT_LT(at + *in->raw_chunk_limit(), m.size());
@@ -16894,6 +19367,20 @@ TEST(WindowKinds, BuildTheirNodesFromTheContext) {
   auto *checked_node = dynamic_cast<decode_window_node *>(checked.get());
   ASSERT_NE(a_node, nullptr);
   ASSERT_NE(checked_node, nullptr);
+  EXPECT_FALSE(a->has_one_shot_path());
+  auto *streaming = a->streaming();
+  ASSERT_NE(streaming, nullptr);
+  EXPECT_EQ(streaming->num_msyn_per_decode(), 0u);
+  const window_spec schedule{5, 2, 1, 1};
+  const std::vector<streaming_task_graph_node::input_schedule> window_input{
+      {0, schedule}};
+  const auto derived = a_node->derive_streaming_schedule(0, window_input);
+  ASSERT_TRUE(derived);
+  EXPECT_EQ(*derived, schedule);
+  EXPECT_FALSE(a_node->derive_streaming_schedule(a_node->outputs().size(),
+                                                window_input));
+  EXPECT_FALSE(a_node->derive_streaming_schedule(
+      0, std::vector<streaming_task_graph_node::input_schedule>{}));
   EXPECT_EQ(b->inputs(),
             (std::vector<std::string>{"input", "receive_0", "receive_1"}));
   // A random window is beyond a single-error table: unchecked, it fires;
@@ -16911,10 +19398,57 @@ TEST(WindowKinds, BuildTheirNodesFromTheContext) {
   expect_lowering_error([&] { build("decode_window", bare); },
                         "task graph node 'lonely': a decode_window node is "
                         "built only within a windowed topology");
-  expect_lowering_error([&] { build("logical_readout", bare); },
-                        "task graph node 'lonely': a logical_readout node "
-                        "reads its template from dem_chunks");
 } // end - TEST(WindowKinds, BuildTheirNodesFromTheContext)
+
+TEST(WindowKinds, LogicalReadoutRequiresTemplateContext) {
+  const cudaqx::heterogeneous_map params{};
+  node_build_context bare;
+  bare.id = "lonely";
+  bare.node_params = &params;
+  const auto *factory = find_node_factory("logical_readout");
+  ASSERT_NE(factory, nullptr);
+  expect_lowering_error(
+      [&] { (*factory)(bare); },
+      "task graph node 'lonely': a logical_readout node "
+      "reads its template from dem_chunks");
+} // end - TEST(WindowKinds, LogicalReadoutRequiresTemplateContext)
+
+TEST(WindowKinds, IngestStreamingContracts) {
+  const auto spec = arbitrary_memory_spec(5);
+  data_artifact_store store;
+  const auto context = store.add_template(spec);
+  const auto layers = layered(2, 1, 3);
+  const std::vector<experimental::ingest_window> windows{
+      {"A", layers.a, ""}};
+  ingest_node node(context, windows);
+
+  auto *streaming = node.streaming();
+  ASSERT_NE(streaming, nullptr);
+  EXPECT_TRUE(streaming->exact_interval_coverage());
+  EXPECT_EQ(streaming->corrections(), nullptr);
+}
+
+TEST(WindowKinds, IngestFactoryViaLoweredTopologyMatchesOneShot) {
+  const auto spec = arbitrary_memory_spec(5);
+  const cudaqx::heterogeneous_map params{
+      {"commit_rounds", std::size_t{2}},
+      {"buffer_rounds", std::size_t{1}},
+      {"output", std::string("corrections")}};
+  lowered_pattern pattern(spec, params);
+  auto graph = decoding_task_graph::from_topology(
+      std::move(pattern.nodes), std::move(pattern.edges));
+  auto reference = decoding_task_graph::from_spec(spec, "single_error_lut");
+
+  data_artifact_store store;
+  const auto context = store.add_template(spec);
+  measurement_results shot;
+  shot.bits.assign(context->measurement_offset(5, 5), 0);
+
+  const auto actual = graph->run(shot);
+  const auto expected = reference->run(shot);
+  EXPECT_TRUE(actual.converged);
+  EXPECT_EQ(actual.bits, expected.bits);
+}
 
 // from_topology builds a windowed graph's nodes from what it resolves, so a
 // builder's own error is reported as itself; a graph whose nodes build
@@ -16938,6 +19472,53 @@ TEST(WindowKinds, BuildingAWindowedGraphStreams) {
       },
       "no_such_decoder");
 } // end - TEST(WindowKinds, BuildingAWindowedGraphStreams)
+
+TEST(WindowKinds, BuildingRejectsSameIndexCycle) {
+  const cudaqx::heterogeneous_map params{
+      {"commit_rounds", std::size_t{2}},
+      {"buffer_rounds", std::size_t{1}},
+      {"output", std::string("corrections")}};
+  lowered_pattern p(arbitrary_memory_spec(5), params);
+  auto nodes = std::move(p.nodes);
+  auto edges = std::move(p.edges);
+
+  bool found_layer = false;
+  for (auto &node : nodes) {
+    if (node.id == "P.A") {
+      node.node_params = {{"num_receives", std::size_t{1}}};
+      found_layer = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found_layer);
+
+  bool found_receive = false;
+  for (auto &edge : edges) {
+    if (edge.from_node == "P.A" && edge.to_node == "P.B" &&
+        edge.to_input == "receive_0") {
+      edge.index_offset = 0;
+      found_receive = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found_receive);
+  edges.push_back({"P.B", "forward", "P.A", "receive_0", 0});
+
+  std::string diagnostic;
+  expect_lowering_error(
+      [&] {
+        try {
+          decoding_task_graph::from_topology(std::move(nodes),
+                                             std::move(edges));
+        } catch (const std::exception &e) {
+          diagnostic = e.what();
+          throw;
+        }
+      },
+      "receives at index_offset 0 form a cycle");
+  EXPECT_NE(diagnostic.find("P.A"), std::string::npos) << diagnostic;
+  EXPECT_NE(diagnostic.find("P.B"), std::string::npos) << diagnostic;
+}
 
 TEST(WindowKinds, RejectsOverlappingPatternOutputs) {
   const auto pattern = [](const std::string &id) {
@@ -17121,6 +19702,48 @@ TEST(WindowKinds, ChecksFiniteWindowCommitIntervals) {
   repeating.add("B", spec, 6, 0, {{0, 1}, {1, 3}, {3, 6}}, {1});
   expect_lowering_error([&] { repeating.build(); },
                         "overlapping commit intervals");
+}
+
+TEST(WindowKinds, FiniteWindowCommitIntervalEdgeCases) {
+  auto spec = single_round_spec();
+  spec.connections.erase(spec.connections.begin() + 1);
+  spec.num_rounds = 3;
+
+  composed_window_partitions empty_selected_window;
+  empty_selected_window.add("A", spec, 8, 0, {{0, 3}, {5, 8}}, {1});
+  empty_selected_window.add("B", spec, 8, 0, {{0, 3}}, {0});
+  const auto empty_selected_graph = empty_selected_window.build();
+  ASSERT_TRUE(empty_selected_graph->supports_streaming());
+  const std::uint8_t zeros[4]{};
+  for (std::size_t r = 0; r < 3; ++r)
+    empty_selected_graph->enqueue_syndrome(
+        zeros, 4, r == 2 ? round_type::FINAL : round_type::BULK);
+  const auto empty_selected_result =
+      empty_selected_graph->streaming_result();
+  EXPECT_EQ(empty_selected_result.status,
+            task_graph_streaming_status::complete);
+  EXPECT_EQ(empty_selected_result.outputs[0].coverage_end_round, 3u);
+
+  composed_window_partitions full_period_overlap;
+  full_period_overlap.add("A", spec, 3, 0, {{0, 3}}, {0});
+  full_period_overlap.add("B", spec, 4, 0, {{0, 4}}, {0});
+  expect_lowering_error([&] { full_period_overlap.build(); },
+                        "overlapping commit intervals");
+
+  composed_window_partitions scan_advancement;
+  scan_advancement.add("A", spec, 4, 2, {{0, 1}, {1, 2}, {2, 4}}, {0});
+  scan_advancement.add("B", spec, 4, 0, {{0, 2}, {2, 4}}, {0});
+  const auto scan_advancement_graph = scan_advancement.build();
+  ASSERT_TRUE(scan_advancement_graph->supports_streaming());
+  for (std::size_t r = 0; r < 3; ++r)
+    scan_advancement_graph->enqueue_syndrome(
+        zeros, 4, r == 2 ? round_type::FINAL : round_type::BULK);
+  const auto scan_advancement_result =
+      scan_advancement_graph->streaming_result();
+  EXPECT_EQ(scan_advancement_result.status,
+            task_graph_streaming_status::complete);
+  EXPECT_EQ(scan_advancement_result.outputs[0].coverage_end_round, 3u);
+  EXPECT_EQ(scan_advancement_result.values, (std::vector<std::uint8_t>{0}));
 }
 
 // An ingest node keeps a shot's partial rounds and publications across

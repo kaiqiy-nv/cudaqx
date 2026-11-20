@@ -7,6 +7,7 @@
 #include "DecodingSession.h"
 #include "RpcSlot.h"
 #include "../lib/hardware_guards.h"
+#include "../lib/realtime/decode_target.h"
 #include "../lib/realtime/realtime_decoding.h"
 
 #include "SessionRegistry.h"
@@ -940,6 +941,29 @@ static int cuda_device_count() {
   if (cudaGetDeviceCount(&count) != cudaSuccess)
     return 0;
   return count;
+}
+
+TEST(DecodeTarget, RejectsUnhonorableGraphPinOnBothPaths) {
+  const int impossible_device = cuda_device_count() + 7;
+  cudaq::qec::task_graph_node_config node;
+  node.id = "window";
+  node.kind = "single_window";
+  node.d_sparse = {{0, 1}};
+  node.o_sparse = {{0}};
+  node.decoder_instance =
+      std::make_unique<ControlledDecoder>(impossible_device);
+
+  std::vector<cudaq::qec::task_graph_node_config> nodes;
+  nodes.push_back(std::move(node));
+  auto graph =
+      cudaq::qec::decoding_task_graph::from_topology(std::move(nodes));
+  const auto graph_device = graph->cuda_device_id();
+  ASSERT_TRUE(graph_device.has_value());
+  ASSERT_EQ(*graph_device, impossible_device);
+
+  const cudaq::qec::detail_dispatch::decode_target target(graph.get());
+  EXPECT_THROW(target.pin_device(), std::runtime_error);
+  EXPECT_THROW(target.pin_device_cached(), std::runtime_error);
 }
 
 // A single-node graph whose inner decoder supports graph dispatch must

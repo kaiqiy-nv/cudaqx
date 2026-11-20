@@ -85,6 +85,23 @@ TEST(StaticSource, ResetRewindsToRoundZeroFromAnywhereAndIsIdempotent) {
   expect_full_replay();
 }
 
+TEST(SyndromeSource, DefaultResetDoesNotRewindSourcesThatDoNotOverrideIt) {
+  class nonrewindable_source final : public syndrome_source {
+  public:
+    std::vector<std::uint8_t> next_round() override {
+      return {next_value_++};
+    }
+
+  private:
+    std::uint8_t next_value_ = 1;
+  } source;
+
+  syndrome_source &source_interface = source;
+  EXPECT_EQ(source_interface.next_round(), (std::vector<std::uint8_t>{1}));
+  source_interface.reset();
+  EXPECT_EQ(source_interface.next_round(), (std::vector<std::uint8_t>{2}));
+}
+
 TEST(StaticSource, PassesThroughNonBinaryValuesUnchanged) {
   // static_source is a pure replay buffer: next_round() returns a copy of
   // whatever it was handed, with no check that values are really 0/1 --
@@ -377,6 +394,37 @@ TEST(StimMemorySourceVsFullCircuit,
   EXPECT_EQ(cases, 5 * std::size(kSweep) + std::size(kColorSweep));
 }
 
+TEST(StimMemorySourceVsFullCircuit, ReadDataStartsANewSeededShot) {
+  constexpr std::uint64_t kSeed = 73;
+  constexpr shape kShape{3, 5};
+  constexpr double kNoise = 0.001;
+  auto params = params_for("repetition_code", "memory", kShape, kNoise);
+  const stim::Circuit circuit =
+      generate("repetition_code", "memory", kShape, kNoise);
+  stim_memory_source source(params, kSeed);
+
+  const std::string first_shot_reference =
+      sample_whole_circuit_once(circuit, kSeed, zero_reference(circuit));
+  const std::size_t stabilizer_bits_needed =
+      circuit.count_measurements() - source.data_width();
+  std::string first_shot;
+  while (first_shot.size() < stabilizer_bits_needed)
+    for (auto bit : source.next_round())
+      first_shot += char('0' + bit);
+  for (auto bit : source.read_data())
+    first_shot += char('0' + bit);
+  EXPECT_EQ(first_shot, first_shot_reference);
+
+  const std::string next_shot_reference = sample_whole_circuit_once(
+      circuit, kSeed + 1, zero_reference(circuit));
+  std::vector<std::uint8_t> expected_next_round;
+  expected_next_round.reserve(source.round_width());
+  for (std::size_t i = 0; i < source.round_width(); ++i)
+    expected_next_round.push_back(
+        static_cast<std::uint8_t>(next_shot_reference[i] - '0'));
+  EXPECT_EQ(source.next_round(), expected_next_round);
+}
+
 TEST(StimMemorySourceVsFullCircuit,
      AGeneratedMemoryCircuitsReferenceSampleIsAllZero) {
   // Why the check above can compare noise frames as measurement outcomes: a
@@ -524,6 +572,44 @@ TEST(CudaqMemorySource, ReadDataAfterVariableRoundCountMatchesDirectCall) {
     for (std::size_t i = 0; i < data.size(); ++i)
       EXPECT_EQ(data[i], reference[ancilla_width + i]) << "k=" << k;
   }
+}
+
+TEST(CudaqMemorySource,
+     ReadDataReturnsCurrentReadoutAndBeginsNextGeneration) {
+  constexpr std::uint64_t kBaseSeed = 71;
+  constexpr std::size_t kMaxRounds = 4;
+  constexpr std::size_t kReadRounds = 2;
+
+  auto code = cudaq::qec::get_code("repetition",
+                                   cudaqx::heterogeneous_map{{"distance", 3}});
+  auto noise = make_noise();
+  const auto current_reference = raw_measurements(
+      *code, cudaq::qec::operation::prep0, kReadRounds, noise, kBaseSeed);
+  const auto next_reference = raw_measurements(
+      *code, cudaq::qec::operation::prep0, 1, noise, kBaseSeed + 1);
+
+  cudaq_memory_source source(*code, cudaq::qec::operation::prep0, kMaxRounds,
+                             noise, kBaseSeed);
+  const std::size_t round_width = source.round_width();
+  const std::size_t data_width = source.data_width();
+  ASSERT_EQ(current_reference.size(), kReadRounds * round_width + data_width);
+  ASSERT_EQ(next_reference.size(), round_width + data_width);
+
+  for (std::size_t i = 0; i < kReadRounds; ++i)
+    ASSERT_EQ(source.next_round().size(), round_width);
+
+  const auto data = source.read_data();
+  ASSERT_EQ(data.size(), data_width);
+  const auto expected_data = std::vector<std::uint8_t>(
+      current_reference.begin() + kReadRounds * round_width,
+      current_reference.end());
+  EXPECT_EQ(data, expected_data);
+
+  const auto next_round = source.next_round();
+  ASSERT_EQ(next_round.size(), round_width);
+  const auto expected_next_round = std::vector<std::uint8_t>(
+      next_reference.begin(), next_reference.begin() + round_width);
+  EXPECT_EQ(next_round, expected_next_round);
 }
 
 TEST(CudaqMemorySource, ARoundBudgetIsEnforcedAndDataNeedsARoundFirst) {

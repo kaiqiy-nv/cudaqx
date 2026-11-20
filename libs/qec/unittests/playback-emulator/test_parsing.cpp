@@ -47,6 +47,11 @@ void expect_all_rejected(const std::vector<bad_line> &cases,
 }
 } // namespace
 
+TEST(Types, UnknownOperationStringifiesAsUnknown) {
+  const auto unknown = static_cast<operation>(0xff);
+  EXPECT_STREQ(to_string(unknown), "unknown");
+}
+
 // ---------------------------------------------------------------------------
 // Baseline: file shape
 // ---------------------------------------------------------------------------
@@ -146,6 +151,16 @@ TEST(Parser, StreamPacingDefaultsToOneTickAndOnlyEveryZeroIsUnpaced) {
   auto unpaced =
       parse("0 stream source=0 every=0 until=c0\n", kTwoDecoders, 1000);
   EXPECT_EQ(unpaced.events[0].stream_every_ticks, 0u);
+}
+
+TEST(Parser, MinRoundsWithoutUntilSetsMaximumToMinimum) {
+  auto sched = parse("0 stream source=0 min_rounds=4\n", kTwoDecoders, 1000);
+  ASSERT_EQ(sched.events.size(), 1u);
+  const auto &stream = sched.events[0];
+  EXPECT_EQ(stream.op, operation::stream);
+  EXPECT_EQ(stream.stream_min_rounds, 4u);
+  EXPECT_EQ(stream.stream_max_rounds, 4u);
+  EXPECT_EQ(stream.until_signal_id, kNoSignal);
 }
 
 // ---------------------------------------------------------------------------

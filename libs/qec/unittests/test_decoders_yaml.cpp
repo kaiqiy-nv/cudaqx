@@ -2935,6 +2935,17 @@ TEST(WindowRequestYAML, ParsesThePlansLayerA) {
             window_a());
 }
 
+TEST(WindowRequestYAML, RejectsMalformedSyntax) {
+  try {
+    cudaq::qec::window_request_from_yaml_str("period: [");
+    FAIL() << "expected malformed YAML to be rejected";
+  } catch (const std::invalid_argument &e) {
+    EXPECT_NE(std::string(e.what()).find("window request: invalid YAML ("),
+              std::string::npos)
+        << e.what();
+  }
+}
+
 // Every range may be written [b, e] or {rounds: [b, e]}, and both build the
 // same window.
 TEST(WindowRequestYAML, MapFormRangesEqualListForm) {
@@ -2983,6 +2994,30 @@ TEST(WindowRequestYAML, RoundTrips) {
     const auto text = window_request_to_yaml_str(request);
     EXPECT_EQ(window_request_from_yaml_str(text), request) << text;
   }
+}
+
+TEST(WindowRequestYAML, EmitsCombinedOptionalAndMultiRangeRequest) {
+  using namespace cudaq::qec;
+  auto request = window_a();
+  request.output = {port_disposition::closed, round_range{6, 8}};
+  request.columns.merge_identical = true;
+  request.columns.conflicting_parallel = parallel_resolution::most_likely;
+  request.sends[1].mode = send_mode::delta;
+  request.sends[1].rounds = {{0, 1}};
+  request.sends.push_back(
+      {"wide", send_mode::delta, {{-3, -2}, {3, 5}}});
+
+  const auto text = window_request_to_yaml_str(request);
+  EXPECT_EQ(window_request_from_yaml_str(text), request) << text;
+}
+
+TEST(WindowRequestYAML, SerializesRequestRangesIndependently) {
+  using namespace cudaq::qec;
+  auto request = window_a();
+  request.output = {port_disposition::closed, round_range{6, 8}};
+
+  const auto emitted = window_request_to_yaml_str(request);
+  EXPECT_EQ(window_request_from_yaml_str(emitted), request) << emitted;
 }
 
 // A send's rounds are one range, [b, e] or {rounds: [b, e]}, or a list of
@@ -3120,6 +3155,110 @@ TEST(WindowRequestYAML, EmptyValuesFailCleanly) {
     EXPECT_THROW(window_request_from_yaml_str(yaml), std::invalid_argument)
         << to;
   }
+}
+
+TEST(WindowRequestYAML, RejectsScalarFormsAndEmitsRangeMap) {
+  using namespace cudaq::qec;
+  const auto rejects = [](const std::string &yaml,
+                          const std::string &message) {
+    try {
+      window_request_from_yaml_str(yaml);
+      FAIL() << "expected: " << message;
+    } catch (const std::invalid_argument &e) {
+      EXPECT_NE(std::string(e.what()).find("window request: " + message),
+                std::string::npos)
+          << e.what();
+    }
+  };
+
+  auto range_yaml = window_a_yaml();
+  const std::string range = "commit: [0, 3]";
+  range_yaml.replace(range_yaml.find(range), range.size(),
+                     "commit: malformed");
+  rejects(range_yaml, "a round range is [begin, end]");
+
+  auto send_yaml = window_a_yaml();
+  const std::string send = "{id: backward}";
+  send_yaml.replace(send_yaml.find(send), send.size(),
+                    "{id: backward, rounds: malformed}");
+  rejects(send_yaml,
+          "a send's rounds are [begin, end] or a list of ranges");
+
+  const auto request = window_a();
+  const auto emitted = window_request_to_yaml_str(request);
+  EXPECT_EQ(window_request_from_yaml_str(emitted), request) << emitted;
+}
+
+TEST(WindowRequestYAML, SerializesRangeMapForm) {
+  using namespace cudaq::qec;
+  const std::string input = R"(period: 12
+zones: {commit: {rounds: [0, 9]}}
+ports:
+  input: {disposition: open, prior: 0.01}
+  output: {disposition: open}
+sends: [{id: backward, mode: residual, rounds: {rounds: [0, 1]}}]
+)";
+  const auto request = window_request_from_yaml_str(input);
+  const auto emitted = window_request_to_yaml_str(request);
+  const auto parsed = window_request_from_yaml_str(emitted);
+
+  EXPECT_EQ(parsed, request) << emitted;
+  EXPECT_EQ(parsed.commit, (round_range{0, 9}));
+  ASSERT_EQ(parsed.sends.size(), 1);
+  EXPECT_EQ(parsed.sends.front().rounds,
+            (std::vector<round_range>{{0, 1}}));
+}
+
+TEST(WindowRequestYAML, RejectsNonIntegerRoundEndpoint) {
+  using namespace cudaq::qec;
+  auto yaml = window_a_yaml();
+  const std::string send = "{id: backward}";
+  yaml.replace(yaml.find(send), send.size(),
+               "{id: backward, mode: residual, rounds: [not-an-integer, 1]}");
+
+  try {
+    window_request_from_yaml_str(yaml);
+    FAIL() << "expected non-integer round endpoint to be rejected";
+  } catch (const std::invalid_argument &e) {
+    EXPECT_NE(std::string(e.what()).find("window request: invalid YAML"),
+              std::string::npos)
+        << e.what();
+  }
+}
+
+TEST(WindowRequestYAML,
+     RejectsScalarRoundsEmptyItemAndUnknownRangeMapKey) {
+  using namespace cudaq::qec;
+  const auto with = [](const std::string &from, const std::string &to) {
+    auto yaml = window_a_yaml();
+    const auto at = yaml.find(from);
+    EXPECT_NE(at, std::string::npos) << from;
+    if (at != std::string::npos)
+      yaml.replace(at, from.size(), to);
+    return yaml;
+  };
+  const auto rejects = [](const std::string &yaml,
+                          const std::string &message) {
+    try {
+      window_request_from_yaml_str(yaml);
+      ADD_FAILURE() << "expected: " << message;
+    } catch (const std::invalid_argument &e) {
+      EXPECT_NE(std::string(e.what()).find("window request: " + message),
+                std::string::npos)
+          << e.what();
+    }
+  };
+
+  rejects(with("{id: backward}", "{id: backward, rounds: 17}"),
+          "a send's rounds are [begin, end] or a list of ranges");
+  rejects(with("{id: backward}",
+               "{id: backward, rounds: [null]}"),
+          "invalid YAML");
+  rejects(with("sends: [{id: forward}, {id: backward}]",
+               "sends:\n  - {id: forward}\n  - id: backward\n    rounds:\n      -"),
+          "a send's rounds are [begin, end] or a list of ranges");
+  rejects(with("commit: [0, 3]", "commit: {ronds: [0, 3]}"),
+          "unknown key 'ronds' in a round range");
 }
 
 // A hand-written parallel-window graph, with a two-input xor, over
@@ -4124,6 +4263,23 @@ TEST(DataArtifactStore, FillsFromTheConfig) {
   EXPECT_EQ(records_of(store, "window").size(), variants);
 } // end - TEST(DataArtifactStore, FillsFromTheConfig)
 
+TEST(DataArtifactStore, HashesInlineStimDemArtifacts) {
+  namespace cfg = cudaq::qec::decoding::config;
+  cfg::multi_decoder_config config;
+  cfg::data_artifact entry;
+  entry.name = "inline_text";
+  entry.stim_dem = "abc";
+  config.data_artifacts.push_back(entry);
+
+  const auto store =
+      cudaq::qec::decoding::host::fill_data_artifact_store(config, ".");
+
+  EXPECT_EQ(records_of(store, "stim_dem"),
+            (std::vector<cudaq::qec::data_artifact_record>{
+                {"stim_dem", 3u,
+                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}}));
+}
+
 // Two decoders naming one template, and a third writing the same content
 // inline, each building windows on it, share one entry and one handle.
 TEST(DataArtifactStore, DecodersNamingOneTemplateShareIt) {
@@ -4838,6 +4994,66 @@ TEST(PatternKind, FillsTheStoreWithTheWindowsItsHookDeclares) {
     EXPECT_NE(store.find_window(*tmpl, closed, key), nullptr);
   EXPECT_EQ(records_of(store, "window").size(), keys.size());
 } // end - TEST(PatternKind, FillsTheStoreWithTheWindowsItsHookDeclares)
+
+TEST(PatternKind, FillsTheStoreForEnsembleMemberWindows) {
+  namespace cfg = cudaq::qec::decoding::config;
+  using cudaq::qec::decoding::host::fill_data_artifact_store;
+  using cudaq::qec::experimental::port_disposition;
+  const std::string name = "test_only_ensemble_windowed_pattern";
+  cudaq::qec::task_graph_node_kind_spec spec;
+  cudaq::qec::decoding::config::decoder_schema params;
+  cudaq::qec::node_pattern pattern;
+  cudaq::qec::experimental::window_request closed;
+  std::vector<std::size_t> seen_rounds;
+  closed.period = 1;
+  closed.commit = cudaq::qec::experimental::round_range{0, 1};
+  closed.input.disposition = port_disposition::closed;
+  closed.output.disposition = port_disposition::closed;
+  spec.name = name;
+  spec.requires_decoder = false;
+  params.params.push_back({"rounds", cfg::param_kind::uint64});
+  pattern.lower = [](cudaq::qec::task_graph_node_config,
+                     std::vector<cudaq::qec::task_graph_node_config> &,
+                     std::vector<cudaq::qec::task_graph_edge> &)
+      -> cudaq::qec::node_pattern::wiring { return {}; };
+  pattern.windows = [&](const cudaqx::heterogeneous_map &node_params,
+                        const cudaq::qec::experiment_template &) {
+    seen_rounds.push_back(node_params.get<std::size_t>("rounds"));
+    return std::vector<
+        std::pair<std::string, cudaq::qec::experimental::window_request>>{
+        {"C", closed}};
+  };
+  cudaq::qec::register_pattern_kind(spec, params, pattern);
+
+  const auto config = cfg::multi_decoder_config::from_yaml_str(
+      pattern_yaml_with(
+          "          type: parallel_window\n"
+          "          commit_rounds: 3\n"
+          "          buffer_rounds: 3\n"
+          "          gap_rounds: 9\n"
+          "          output: corrections\n"
+          "          max_in_flight: 4\n"
+          "          inner: {type: single_error_lut}\n",
+          "          type: ensemble\n"
+          "          join_strategy: deadline\n"
+          "          join_params: {deadline_us: 200000}\n"
+          "          members:\n"
+          "            - nodes:\n"
+          "                - {id: p0, type: " + name + ", rounds: 5}\n"
+          "              edges: [{from: input, to: p0}, {from: p0, to: output}]\n"
+          "            - nodes:\n"
+          "                - {id: p1, type: " + name + ", rounds: 5}\n"
+          "              edges: [{from: input, to: p1}, {from: p1, to: output}]\n"));
+  const auto store = fill_data_artifact_store(config, ".");
+  cudaq::qec::unregister_task_graph_node_kind(name);
+  const auto tmpl = store.find_template(*config.decoders.at(0).dem_chunks);
+  ASSERT_NE(tmpl, nullptr);
+  const auto keys = variant_keys(*tmpl, closed);
+  EXPECT_EQ(seen_rounds, (std::vector<std::size_t>{5, 5}));
+  ASSERT_FALSE(keys.empty());
+  for (const auto &key : keys)
+    EXPECT_NE(store.find_window(*tmpl, closed, key), nullptr);
+} // end - TEST(PatternKind, FillsTheStoreForEnsembleMemberWindows)
 
 // Configuring builds no decoder for a pattern, whose layers build their own
 // from their windows: a pattern beside flat matrices is reported as having

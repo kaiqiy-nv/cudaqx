@@ -254,6 +254,65 @@ private:
   bool fired_ = false;
 };
 
+class test_outcome_forwarder : public task_graph_node,
+                              public streaming_task_graph_node {
+public:
+  void execute_indexed(const std::vector<edge_value> &inputs,
+                       std::vector<edge_value> &outputs) const override {
+    outputs[0] = inputs[0];
+  }
+  std::vector<std::string> inputs() const override { return {"input"}; }
+  std::vector<std::string> outputs() const override { return {"output"}; }
+  std::optional<edge_value_type> output_type(std::size_t slot) const override {
+    return slot == 0 ? std::optional(logical_outcome_type) : std::nullopt;
+  }
+  std::optional<std::size_t> output_value_size(std::size_t slot) const override {
+    return slot == 0 ? std::optional<std::size_t>{3} : std::nullopt;
+  }
+  bool accepts_input_type(std::size_t slot,
+                          edge_value_type type) const override {
+    return slot == 0 && type == logical_outcome_type;
+  }
+  streaming_task_graph_node *streaming() override { return this; }
+
+  bool enqueue(const uint8_t *, std::size_t, round_type) override {
+    return false;
+  }
+  const uint8_t *corrections() const override { return corrections_.data(); }
+  void clear_corrections() override {
+    std::fill(corrections_.begin(), corrections_.end(), 0);
+  }
+  void reset_streaming_state() override { fired_ = false; }
+  std::size_t num_msyn_per_decode() const override { return 0; }
+  std::size_t num_observables() const override { return corrections_.size(); }
+  bool supports_streaming_input(std::size_t slot) const override {
+    return slot == 0;
+  }
+  std::optional<window_spec> derive_streaming_schedule(
+      std::size_t output_slot,
+      const std::vector<input_schedule> &inputs) const override {
+    if (output_slot != 0 || inputs.size() != 1 || inputs[0].slot != 0)
+      return std::nullopt;
+    return inputs[0].schedule;
+  }
+  const edge_value *streaming_output(std::size_t slot) const override {
+    return fired_ && slot == 0 ? &saved_ : nullptr;
+  }
+  bool enqueue_edge_value(const edge_value &value,
+                          std::size_t slot) override {
+    if (slot != 0)
+      return false;
+    saved_ = value;
+    corrections_ = value.get<logical_outcome>().bits;
+    return fired_ = true;
+  }
+
+private:
+  std::vector<uint8_t> corrections_ = std::vector<uint8_t>(3, 0);
+  edge_value saved_{logical_outcome{}};
+  bool fired_ = false;
+};
+
 template <typename T>
 void register_test_kind(const char *name) {
   task_graph_node_kind_spec spec;
@@ -272,6 +331,7 @@ const bool registered = [] {
   register_test_kind<test_cancel_only>("test_cancel_only");
   register_test_kind<test_detectors>("test_detectors");
   register_test_kind<test_windower>("test_windower");
+  register_test_kind<test_outcome_forwarder>("test_outcome_forwarder");
   return true;
 }();
 
@@ -517,6 +577,22 @@ TEST(SelectionStrategy, FirstAcceptsOnlyConvergedCandidates) {
   EXPECT_NE(std::find(names.begin(), names.end(), "deadline"), names.end());
 }
 
+TEST(SelectionStrategy, FirstFactoryCreatesIndependentStrategies) {
+  auto first = make_selection_strategy("first", {});
+  auto second = make_selection_strategy("first", {});
+  first->begin(cancellation_source{}, candidate_sink{});
+  second->begin(cancellation_source{}, candidate_sink{});
+
+  const auto first_result = first->offer({marker(0), "first", std::nullopt});
+  const auto second_result = second->offer({marker(1), "second", std::nullopt});
+  ASSERT_TRUE(first_result);
+  ASSERT_TRUE(second_result);
+  EXPECT_EQ(first_result->bits, marker_bits(0));
+  EXPECT_EQ(second_result->bits, marker_bits(1));
+  EXPECT_FALSE(first->offer({marker(2), "late-first", std::nullopt}));
+  EXPECT_FALSE(second->offer({marker(2), "late-second", std::nullopt}));
+}
+
 /// A sink whose observer is the strategy, as the fan-out wires it.
 candidate_sink sink_for(selection_strategy &s) {
   candidate_sink sink;
@@ -594,9 +670,56 @@ TEST(SelectionStrategy, DeadlineRequestsASoftStopAheadAndDisarmsOnFinish) {
   EXPECT_EQ(quiet.level(), cancellation_level::none);
 }
 
+TEST(SelectionStrategy, DeadlineReschedulesWhenEarlierTimerIsArmed) {
+  auto later = make_selection_strategy("deadline", deadline(2000000));
+  cancellation_source later_cancel;
+  later->begin(later_cancel, candidate_sink{});
+  std::this_thread::sleep_for(20ms);
+
+  auto earlier = make_selection_strategy("deadline", deadline(100000));
+  cancellation_source earlier_cancel;
+  earlier->begin(earlier_cancel, candidate_sink{});
+  std::this_thread::sleep_for(160ms);
+
+  EXPECT_EQ(earlier_cancel.level(), cancellation_level::hard);
+  EXPECT_EQ(later_cancel.level(), cancellation_level::none);
+  EXPECT_FALSE(earlier->finish());
+  EXPECT_FALSE(later->finish());
+}
+
 // ---------------------------------------------------------------------------
 // The ensemble pattern, one-shot
 // ---------------------------------------------------------------------------
+
+TEST(EnsembleGraph, FanoutUnknownOutputSlotReturnsNoType) {
+  cudaqx::heterogeneous_map params;
+  params.insert("strategy", std::string("first"));
+  node_build_context ctx;
+  ctx.node_params = &params;
+
+  const auto *factory = find_node_factory("ensemble_fanout");
+  ASSERT_NE(factory, nullptr);
+  auto fanout = (*factory)(ctx);
+  ASSERT_NE(fanout, nullptr);
+  auto *streaming = fanout->streaming();
+  ASSERT_NE(streaming, nullptr);
+  EXPECT_EQ(streaming->corrections(), nullptr);
+  EXPECT_TRUE(fanout->output_type(3).has_value());
+  EXPECT_FALSE(fanout->output_type(4).has_value());
+}
+
+TEST(EnsembleGraph, CandidatePushReportsNoRawMeasurementsPerDecode) {
+  node_build_context ctx;
+  ctx.id = "push";
+
+  const auto *factory = find_node_factory("candidate_push");
+  ASSERT_NE(factory, nullptr);
+  auto push = (*factory)(ctx);
+  ASSERT_NE(push, nullptr);
+  auto *streaming = push->streaming();
+  ASSERT_NE(streaming, nullptr);
+  EXPECT_EQ(streaming->num_msyn_per_decode(), 0u);
+}
 
 TEST(EnsembleGraph, BuildValidatesThePattern) {
   EXPECT_THROW(make_ensemble({}), std::invalid_argument);
@@ -881,12 +1004,100 @@ TEST(EnsembleGraph, BuildRejectsMembersOfDifferentWidths) {
   EXPECT_THROW(build(ensemble_of(std::move(ms))), std::invalid_argument);
 }
 
+TEST(EnsembleStreaming, NonPublishingMemberUsesDefaultStreamingOutput) {
+  const std::string id = "streaming_output_default";
+  specs.emplace(id, std::make_pair(make_probe(0), std::size_t{0}));
+  test_member member(id);
+  specs.erase(id);
+
+  auto *streaming = member.streaming();
+  ASSERT_NE(streaming, nullptr);
+  EXPECT_EQ(streaming->streaming_output(0), nullptr);
+}
+
 TEST(EnsembleStreaming, NeedsAStreamingProducer) {
   // Fed raw measurements, the fan-out has no windows to forward: the ensemble
   // knows nothing about rounds, so it is one-shot only.
   auto raw = make_ensemble({{make_probe(0), 0}});
   EXPECT_FALSE(raw->supports_streaming());
   EXPECT_FALSE(raw->streaming_incompatibility_reason().empty());
+}
+
+TEST(EnsembleStreaming, FanoutRejectsRawChunks) {
+  cudaqx::heterogeneous_map params;
+  params.insert("strategy", std::string("first"));
+  node_build_context ctx;
+  ctx.id = "fanout";
+  ctx.node_params = &params;
+
+  const auto *factory = find_node_factory("ensemble_fanout");
+  ASSERT_NE(factory, nullptr);
+  auto node = (*factory)(ctx);
+  auto *streaming = dynamic_cast<streaming_task_graph_node *>(node.get());
+  ASSERT_NE(streaming, nullptr);
+
+  const uint8_t chunk[] = {1, 0};
+  EXPECT_FALSE(streaming->enqueue(chunk, sizeof(chunk), round_type::BULK));
+  EXPECT_EQ(streaming->streaming_output(0), nullptr);
+}
+
+TEST(EnsembleStreaming, JoinRejectsRawChunks) {
+  cudaqx::heterogeneous_map params;
+  params.insert("done_inputs", std::size_t{1});
+  params.insert("num_observables", std::size_t{3});
+  node_build_context ctx;
+  ctx.id = "join";
+  ctx.node_params = &params;
+
+  const auto *factory = find_node_factory("ensemble_join");
+  ASSERT_NE(factory, nullptr);
+  auto node = (*factory)(ctx);
+  auto *streaming = dynamic_cast<streaming_task_graph_node *>(node.get());
+  ASSERT_NE(streaming, nullptr);
+
+  const uint8_t chunk[] = {1, 0};
+  EXPECT_FALSE(streaming->enqueue(chunk, sizeof(chunk), round_type::BULK));
+  ASSERT_NE(streaming->corrections(), nullptr);
+  EXPECT_EQ(std::vector<uint8_t>(streaming->corrections(),
+                                 streaming->corrections() + 3),
+            (std::vector<uint8_t>{0, 0, 0}));
+  EXPECT_EQ(streaming->streaming_output(0), nullptr);
+}
+
+TEST(EnsembleStreaming, JoinReportsOutputSizeForValidAndUnknownSlots) {
+  cudaqx::heterogeneous_map params;
+  params.insert("done_inputs", std::size_t{1});
+  params.insert("num_observables", std::size_t{3});
+  node_build_context ctx;
+  ctx.id = "join";
+  ctx.node_params = &params;
+
+  const auto *factory = find_node_factory("ensemble_join");
+  ASSERT_NE(factory, nullptr);
+  auto node = (*factory)(ctx);
+
+  auto output_size = node->output_value_size(0);
+  ASSERT_TRUE(output_size);
+  EXPECT_EQ(*output_size, 3u);
+  EXPECT_FALSE(node->output_value_size(1).has_value());
+}
+
+TEST(EnsembleStreaming, JoinOutputFeedsDownstreamStreamingNode) {
+  std::vector<task_graph_node_config> nodes;
+  nodes.push_back(node("win", "test_windower"));
+  nodes.push_back(ensemble("ens", {{make_probe(1), 0}}, "first"));
+  nodes.push_back(node("forward", "test_outcome_forwarder"));
+  auto g = decoding_task_graph::from_topology(
+      std::move(nodes),
+      {{"measurements", "output", "win", "input"},
+       {"win", "output", "ens", "input"},
+       {"ens", "output", "forward", "input"},
+       {"forward", "output", "output", "input"}});
+
+  ASSERT_TRUE(g->supports_streaming()) << g->streaming_incompatibility_reason();
+  const uint8_t window[2] = {1, 0};
+  EXPECT_TRUE(g->enqueue_syndrome(window, 2));
+  EXPECT_EQ(corrections(*g), marker_bits(0));
 }
 
 TEST(EnsembleStreaming, OutputWidthIsInferredFromAMemberThatReachesOutput) {

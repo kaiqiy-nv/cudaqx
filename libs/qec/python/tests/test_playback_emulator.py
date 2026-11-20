@@ -426,3 +426,58 @@ def test_a_cudaq_memory_source_spec_drives_a_run_and_rejects_bad_params():
                    **params, "state_prep": "not_a_real_op"
                }},
                null_decoder_ids=[0])
+
+
+@pytest.mark.parametrize("state_prep", ["prep0", "prep1", "prepp", "prepm"])
+def test_cudaq_memory_source_accepts_supported_state_preps(state_prep):
+    result = pb.run(
+        "0 stream source=0 rounds=1\n",
+        1000,
+        {0: {
+            "type": "cudaq_memory",
+            "code": qec.get_code("steane"),
+            "state_prep": state_prep,
+            "max_rounds": 1,
+            "seed": 1,
+        }},
+        null_decoder_ids=[0],
+    )
+
+    record = result.records[0]
+    assert record["dispatched"] is True
+    assert record["status"] == 100
+    assert record["rounds_streamed"] == 1
+    assert len(record["syndrome_bits"]) == 6
+
+
+def test_inproc_decoder_uses_final_mapping_for_enqueue_data():
+    config = qec.multi_decoder_config.from_yaml_str("""\
+decoders:
+  - id: 0
+    type: single_error_lut
+    block_size: 3
+    syndrome_size: 3
+    H_sparse: [0,-1,1,-1,2,-1]
+    O_sparse: [0,-1,1,-1,2,-1]
+    D_sparse: [0,-1,1,-1,2,-1]
+syndrome_mapping:
+  - {id: 1, type: final}
+""")
+    result = pb.run(
+        "0 reset\n1 enqueue_data source=0b100\n"
+        "2 get_corrections return_size=3\n",
+        1000,
+        decoders=config,
+    )
+
+    assert len(result.records) == 3
+    assert all(record["dispatched"] for record in result.records)
+    assert result.records[0]["status"] == 0
+    assert result.records[1]["status"] == 100
+    correction_record = result.records[2]
+    assert correction_record["read_completed"] is True
+    assert correction_record["correction_bits"] == "100"
+    header, data = rows(result)
+    assert cell(header, data[2], "correction_bits") == correction_record[
+        "correction_bits"
+    ]
